@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+build/
+work/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+
+# 本地环境配置；示例配置可提交。
+.env
+.env.*
+!.env.example

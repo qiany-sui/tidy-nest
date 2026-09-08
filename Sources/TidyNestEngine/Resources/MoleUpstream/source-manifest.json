@@ -1,0 +1,97 @@
+{
+  "upstream": "https://github.com/tw93/Mole",
+  "tag": "V1.53.0",
+  "archiveSHA256": "35c812d5298a08c672062ac4e1d5a523876144ff0708f9c5c77385d52faccc77",
+  "license": "GPL-3.0-or-later",
+  "note": "固定源码摘录仅供审计；Swift 实现移植保护子集并收窄范围，不执行原始 shell。",
+  "files": [
+    {
+      "path": "lib/core/app_protection.sh",
+      "ranges": [
+        [
+          70,
+          646
+        ]
+      ],
+      "sourceSHA256": "257e974c0a321fc99dfbc1d4171ece840bf10e7dcfb60f7d7ed1ca7cecd74648",
+      "excerptFile": "lib__core__app_protection.sh.txt",
+      "excerptSHA256": "880f77e8b9f755038026c77ce09035f16d193bd0e07abd73f4384b6893c03230"
+    },
+    {
+      "path": "lib/core/app_protection_data.sh",
+      "ranges": [
+        [
+          1,
+          627
+        ]
+      ],
+      "sourceSHA256": "0aa1b21cc6cbdb625c22f543a8eb23081b6c9bfccaf268993954973143507db7",
+      "excerptFile": "lib__core__app_protection_data.sh.txt",
+      "excerptSHA256": "271afdcbb458b65379c89938c9c26ec72705f2ffcfe074147ce88139c366df9d"
+    },
+    {
+      "path": "lib/core/base.sh",
+      "ranges": [
+        [
+          148,
+          190
+        ],
+        [
+          280,
+          426
+        ],
+        [
+          795,
+          822
+        ]
+      ],
+      "sourceSHA256": "4a0a98664d41f5a2f82397ee873b82bc40ee2a32c224acef9690ac134e073df3",
+      "excerptFile": "lib__core__base.sh.txt",
+      "excerptSHA256": "6fae01175f362d73d0f83a7cc0c153950f27df613b6416ab58909e7891276307"
+    },
+    {
+      "path": "lib/clean/user.sh",
+      "ranges": [
+        [
+          113,
+          205
+        ]
+      ],
+      "sourceSHA256": "f67017fe793c6a20d95ae15e6c1a43a0056720bfd3e8b51c8a37791699f8c384",
+      "excerptFile": "lib__clean__user.sh.txt",
+      "excerptSHA256": "fc5d72136ea5c9fa6754d8146e102b94d5f084ea3d39c466a5396facef70e36e"
+    },
+    {
+      "path": "lib/core/file_ops.sh",
+      "ranges": [
+        [
+          164,
+          820
+        ]
+      ],
+      "sourceSHA256": "7ab1247f818f300f0f6a194dcac7470d6d7fc34f24ee5829d3d53b705b8edf6a",
+      "excerptFile": "lib__core__file_ops.sh.txt",
+      "excerptSHA256": "8c176f4740e6ed9c72c277703adff46a930e2e739af1f3557424609a425bc4b3"
+    },
+    {
+      "path": "lib/uninstall/batch.sh",
+      "ranges": [
+        [
+          679,
+          1106
+        ],
+        [
+          1272,
+          1317
+        ],
+        [
+          1880,
+          1940
+        ]
+      ],
+      "sourceSHA256": "3d7c7d30acb252498eec958d34084d2ce9b6e7fc691d904ad40c61ea31123643",
+      "excerptFile": "lib__uninstall__batch.sh.txt",
+      "excerptSHA256": "2649b1c83f6c86a8a041d0a7538620d661af81ac18494c32d28a5bcee9b2414e"
+    }
+  ]
+}

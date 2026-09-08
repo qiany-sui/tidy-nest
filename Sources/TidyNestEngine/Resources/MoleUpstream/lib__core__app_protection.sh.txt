@@ -1,0 +1,579 @@
+# Upstream lib/core/app_protection.sh:70-646
+    local bundle_id="$1"
+    local pattern="$2"
+
+    [[ -z "$pattern" ]] && return 1
+
+    # Use bash [[  ]] for glob pattern matching (works with variables in bash 3.2+)
+    # shellcheck disable=SC2053  # allow glob pattern matching
+    if [[ "$bundle_id" == $pattern ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Helper to build regex from array (Bash 3.2 compatible - no namerefs)
+# $1: Variable name to store result
+# $2...: Array elements (passed as expanded list)
+build_regex_var() {
+    local var_name="$1"
+    shift
+    local regex=""
+    for pattern in "$@"; do
+        # Escape dots . -> \.
+        local p="${pattern//./\\.}"
+        # Convert * to .*
+        p="${p//\*/.*}"
+        # Start and end anchors
+        p="^${p}$"
+
+        if [[ -z "$regex" ]]; then
+            regex="$p"
+        else
+            regex="$regex|$p"
+        fi
+    done
+    # eval: indirect write by name; bash 3.2 has no nameref
+    eval "$var_name=\"\$regex\""
+}
+
+# Lazy-loaded regex (only built when needed)
+APPLE_UNINSTALLABLE_REGEX=""
+SYSTEM_CRITICAL_REGEX=""
+
+_ensure_uninstall_regex() {
+    if [[ -z "$SYSTEM_CRITICAL_REGEX" ]]; then
+        build_regex_var APPLE_UNINSTALLABLE_REGEX "${APPLE_UNINSTALLABLE_APPS[@]}"
+        build_regex_var SYSTEM_CRITICAL_REGEX "${SYSTEM_CRITICAL_BUNDLES[@]}"
+    fi
+}
+
+# Check if application is a protected system component
+should_protect_from_uninstall() {
+    local bundle_id="$1"
+
+    _ensure_uninstall_regex
+
+    if [[ "$bundle_id" =~ $APPLE_UNINSTALLABLE_REGEX ]]; then
+        return 1
+    fi
+
+    if [[ "$bundle_id" =~ $SYSTEM_CRITICAL_REGEX ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Print the vendor name when an app must be removed through its official
+# uninstaller instead of Mole's generic Trash/delete path.
+official_uninstaller_vendor() {
+    local bundle_id="${1:-}"
+    local display_name="${2:-}"
+    local app_path="${3:-}"
+    local normalized_bundle normalized_name normalized_path
+    normalized_bundle=$(printf '%s' "$bundle_id" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    normalized_name=$(printf '%s' "$display_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    normalized_path=$(basename "${app_path:-}" .app | LC_ALL=C tr '[:upper:]' '[:lower:]')
+
+    local rule vendor prefixes fragments prefix fragment
+    local -a _prefixes _fragments
+    for rule in "${OFFICIAL_UNINSTALLER_RULES[@]}"; do
+        IFS='|' read -r vendor prefixes fragments <<< "$rule"
+        IFS=',' read -r -a _prefixes <<< "$prefixes"
+        for prefix in "${_prefixes[@]}"; do
+            [[ -n "$prefix" && "$normalized_bundle" == "$prefix"* ]] && {
+                printf '%s\n' "$vendor"
+                return 0
+            }
+        done
+
+        IFS=',' read -r -a _fragments <<< "$fragments"
+        for fragment in "${_fragments[@]}"; do
+            if [[ -n "$fragment" ]] &&
+                { [[ "$normalized_name" == *"$fragment"* ]] || [[ "$normalized_path" == *"$fragment"* ]]; }; then
+                printf '%s\n' "$vendor"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# Check if application data should be protected during cleanup
+should_protect_data() {
+    local bundle_id="$1"
+
+    case "$bundle_id" in
+        com.apple.* | loginwindow | dock | systempreferences | finder | safari)
+            return 0
+            ;;
+        # CUPS is an OS-provided subsystem with no user-facing app; without this
+        # guard `~/Library/Preferences/org.cups.PrintingPrefs.plist` (which holds
+        # the default printer and recent printers) looks orphaned. See #731.
+        org.cups.*)
+            return 0
+            ;;
+        backgroundtaskmanagement* | keychain* | security* | bluetooth* | wifi* | network* | tcc)
+            return 0
+            ;;
+        notification* | accessibility* | universalaccess* | HIToolbox*)
+            return 0
+            ;;
+        *inputmethod* | *InputMethod* | *IME | textinput* | TextInput*)
+            return 0
+            ;;
+        keyboard* | Keyboard* | inputsource* | InputSource* | keylayout* | KeyLayout*)
+            return 0
+            ;;
+        GlobalPreferences | .GlobalPreferences | org.pqrs.Karabiner*)
+            return 0
+            ;;
+        com.1password.* | com.agilebits.* | com.lastpass.* | com.dashlane.* | com.bitwarden.*)
+            return 0
+            ;;
+        com.jetbrains.* | JetBrains* | com.microsoft.* | com.visualstudio.*)
+            return 0
+            ;;
+        com.sublimetext.* | com.sublimehq.* | Cursor | Claude | ChatGPT | com.openai.codex | Codex | codex-runtimes | Ollama)
+            return 0
+            ;;
+        # Specific match to avoid ShellCheck redundancy warning with com.clash.*
+        com.clash.app)
+            return 0
+            ;;
+        com.nssurge.* | com.v2ray.* | com.clash.* | ClashX* | Surge* | Shadowrocket* | Quantumult*)
+            return 0
+            ;;
+        clash-* | Clash-* | *-clash | *-Clash | clash.* | Clash.* | clash_* | *clash-verge* | *Clash-Verge* | clashverge* | ClashVerge*)
+            return 0
+            ;;
+        com.docker.* | com.getpostman.* | com.insomnia.*)
+            return 0
+            ;;
+        com.tencent.* | com.sogou.* | com.baidu.* | com.googlecode.* | im.rime.*)
+            # These might have wildcards, check detailed list
+            for pattern in "${DATA_PROTECTED_BUNDLES[@]}"; do
+                if bundle_matches_pattern "$bundle_id" "$pattern"; then
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+    esac
+
+    # Fallback: check against the full DATA_PROTECTED_BUNDLES list
+    for pattern in "${DATA_PROTECTED_BUNDLES[@]}"; do
+        if bundle_matches_pattern "$bundle_id" "$pattern"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Endpoint security / EDR / MDM agents (CrowdStrike Falcon, SentinelOne, ESET,
+# Jamf, GlobalProtect, Cisco Secure Client) tamper-protect their on-disk state.
+# Deleting anything that belongs to them under the per-user Darwin folder -- a
+# rebuildable Metal/GPU shader cache (.../C/...), a code-signature clone
+# (.../X/<bundle-id>.code_sign_clone), or temp (.../T/...) -- trips sensor tamper
+# detection (e.g. CrowdStrike "MacFalconSensorTamper", MITRE T1562.001) that
+# corporate security reports as malware. Reclaim is only a few MB, so never touch
+# these. The vendor prefixes live in ENDPOINT_SECURITY_BUNDLE_PREFIXES
+# (app_protection_data.sh); matching a vendor id anywhere under var/folders is
+# protection-only, so a wide match is safe. Shared by should_protect_path() and
+# the cache/clone sweeps in lib/clean/system.sh and lib/clean/user.sh.
+is_endpoint_security_cache_path() {
+    local path="$1"
+    # Fast reject: only the per-user Darwin folders are in scope (the real
+    # /private/var/folders and its /var/folders symlink form). Anchored to the
+    # absolute root so an unrelated ".../var/folders/..." path cannot match.
+    case "$path" in
+        /private/var/folders/* | /var/folders/*) ;;
+        *)
+            if ! declare -f _mole_path_is_within_existing_root > /dev/null 2>&1 ||
+                ! _mole_path_is_within_existing_root "$path" "/private/var/folders"; then
+                return 1
+            fi
+            ;;
+    esac
+    local restore_nocasematch=false
+    if ! shopt -q nocasematch; then
+        shopt -s nocasematch
+        restore_nocasematch=true
+    fi
+    local prefix
+    for prefix in "${ENDPOINT_SECURITY_BUNDLE_PREFIXES[@]}"; do
+        if [[ "$path" == *"$prefix"* ]]; then
+            [[ "$restore_nocasematch" == "true" ]] && shopt -u nocasematch
+            return 0
+        fi
+    done
+    [[ "$restore_nocasematch" == "true" ]] && shopt -u nocasematch
+    return 1
+}
+
+is_orbstack_runtime_path() {
+    local path="$1"
+    local restore_nocasematch=false
+    if ! shopt -q nocasematch; then
+        shopt -s nocasematch
+        restore_nocasematch=true
+    fi
+
+    local matched=false
+    case "$path" in
+        */Library/Group\ Containers/*dev.orbstack | */Library/Group\ Containers/*dev.orbstack/* | */.orbstack | */.orbstack/*)
+            matched=true
+            ;;
+    esac
+
+    [[ "$restore_nocasematch" == "true" ]] && shopt -u nocasematch
+    [[ "$matched" == "true" ]]
+}
+
+# E5RT (Apple's Espresso runtime, behind Vision/TextRecognition) keeps compiled
+# model bundles in a com.apple.e5rt.e5bundlecache directory, usually one level
+# below the owning app's or daemon's cache directory. A process that already
+# resolved that cache does not rebuild it: deleting it under a running app makes
+# every later recognition call fail with E5RT Code 13 until the app restarts.
+# Reclaims little, breaks visibly, so treat the directory and its immediate
+# parent as off limits. Shared by safe_clean() and process_container_cache().
+#
+# Args: $1 - path to check
+# Returns: 0 if the path is or directly holds a compiled model cache
+holds_compiled_model_cache() {
+    local path="$1"
+    [[ -z "$path" ]] && return 1
+    if [[ "${path%/}" == *"/com.apple.e5rt.e5bundlecache" ]]; then
+        return 0
+    fi
+    if [[ -d "$path/com.apple.e5rt.e5bundlecache" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Shared XDG and user-local roots contain state owned by many unrelated tools.
+# App display names such as "Local", "Config", or "Cache" can spell these
+# roots with different casing, which still resolves to the same directory on a
+# default case-insensitive APFS volume. Protect the shared roots themselves but
+# not app-specific children such as ~/.config/zed or ~/.local/share/firefox.
+_mole_is_shared_home_state_root() {
+    local path="${1%/}"
+    case "$path" in
+        "$HOME"/.[Cc][Aa][Cc][Hh][Ee] | \
+            "$HOME"/.[Cc][Oo][Nn][Ff][Ii][Gg] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Bb][Ii][Nn] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ll][Ii][Bb] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Hh][Aa][Rr][Ee] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Tt][Aa][Tt][Ee])
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Check if a path is protected from deletion
+# Centralized logic to protect system settings, control center, and critical apps
+#
+# In uninstall mode (MOLE_UNINSTALL_MODE=1), only system-critical components are protected.
+# Data-protected apps (VPNs, dev tools, etc.) can be uninstalled when user explicitly chooses to.
+#
+# Args: $1 - path to check
+# Returns: 0 if protected, 1 if safe to delete
+should_protect_path() {
+    local path="$1"
+    [[ -z "$path" ]] && return 1
+
+    if _mole_is_shared_home_state_root "$path"; then
+        return 0
+    fi
+
+    local _container_cache_path=false
+    local _known_rebuildable_cache_path=false
+
+    # Codex Desktop keeps durable state under Application Support, but these
+    # exact Chromium cache leaves under Library/Caches are rebuildable. Only
+    # their children are eligible; the profile and leaf directories stay.
+    case "$path" in
+        "$HOME/Library/Caches/Codex/Default/Cache/"* | \
+            "$HOME/Library/Caches/Codex/Default/Code Cache/"* | \
+            "$HOME/Library/Caches/Codex/Default/Partitions/codex-browser-app/Cache/"* | \
+            "$HOME/Library/Caches/Codex/Default/Partitions/codex-browser-app/Code Cache/"* | \
+            "$HOME/Library/Caches/Codex/codex-browser-app/Cache/"* | \
+            "$HOME/Library/Caches/Codex/codex-browser-app/Code Cache/"*)
+            _known_rebuildable_cache_path=true
+            ;;
+    esac
+
+    if is_orbstack_runtime_path "$path"; then
+        return 0
+    fi
+
+    # 1. Keyword-based matching for system components (case-insensitive via character classes)
+    case "$path" in
+        *[Ss]ystem[Ss]ettings* | *[Ss]ystem[Pp]references* | *[Cc]ontrol[Cc]enter*)
+            return 0
+            ;;
+        *com.apple.[Ss]ettings* | *com.apple.[Ss]ETTINGS*)
+            return 0
+            ;;
+        *com.apple.[Nn]otes* | *com.apple.[Nn]OTES*)
+            return 0
+            ;;
+    esac
+
+    # 2. Protect caches critical for system UI rendering
+    # These caches are essential for modern macOS (Sonoma/Sequoia) system UI rendering
+    case "$path" in
+        # System Settings and Control Center caches (CRITICAL - prevents blank panel bug)
+        *com.apple.systempreferences.cache* | *com.apple.Settings.cache* | *com.apple.controlcenter.cache*)
+            return 0
+            ;;
+        # Finder and Dock (system essential)
+        *com.apple.finder.cache* | *com.apple.dock.cache*)
+            return 0
+            ;;
+        # System XPC services and sandboxed containers
+        */Library/Containers/com.apple.Settings* | */Library/Containers/com.apple.SystemSettings* | */Library/Containers/com.apple.controlcenter*)
+            return 0
+            ;;
+        */Library/Group\ Containers/com.apple.systempreferences* | */Library/Group\ Containers/com.apple.Settings*)
+            return 0
+            ;;
+        # OrbStack group containers hold live container filesystem images.
+        */Library/Group\ Containers/*dev.orbstack | */Library/Group\ Containers/*dev.orbstack/* | */.orbstack | */.orbstack/*)
+            return 0
+            ;;
+        # Shared file lists for System Settings (macOS Sequoia) - Issue #136
+        */com.apple.sharedfilelist/*com.apple.Settings* | */com.apple.sharedfilelist/*com.apple.SystemSettings* | */com.apple.sharedfilelist/*systempreferences*)
+            return 0
+            ;;
+    esac
+
+    # 3. Extract bundle ID from sandbox paths
+    # Matches: .../Library/Containers/bundle.id/...
+    # Matches: .../Library/Group Containers/group.id/...
+    if [[ "$path" =~ /Library/Containers/([^/]+) ]] || [[ "$path" =~ /Library/Group\ Containers/([^/]+) ]]; then
+        local bundle_id="${BASH_REMATCH[1]}"
+        # Cache and tmp directories inside containers are regenerable by definition.
+        # safe_clean calls explicitly target these; let them through instead of
+        # blocking on the blanket com.apple.* match in should_protect_data.
+        if [[ "$path" == */Data/Library/Caches/* || "$path" == */Data/tmp/* ]]; then
+            _container_cache_path=true
+        elif [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]] && should_protect_data "$bundle_id"; then
+            return 0
+        fi
+    fi
+
+    # 4. Check for specific hardcoded critical patterns
+    case "$path" in
+        *com.apple.Settings* | *com.apple.SystemSettings* | *com.apple.controlcenter* | *com.apple.finder* | *com.apple.dock*)
+            return 0
+            ;;
+    esac
+
+    # 4b. Endpoint security / EDR agent caches (CrowdStrike Falcon, SentinelOne,
+    # etc.). Dedicated predicate so the same vendor list is reused by the
+    # GPU-cache sweep in lib/clean/system.sh and matches deterministically.
+    if is_endpoint_security_cache_path "$path"; then
+        return 0
+    fi
+
+    # 5. Protect critical preference files and user data
+    case "$path" in
+        */Library/Preferences/com.apple.dock.plist | */Library/Preferences/com.apple.finder.plist)
+            return 0
+            ;;
+        # Protect Mole's own runtime logs so cleanup cannot delete its active log targets.
+        */Library/Logs/mole | */Library/Logs/mole/ | */Library/Logs/mole/*)
+            return 0
+            ;;
+        # Codex Desktop and CLI keep conversation indexes and app state in cache-
+        # shaped paths. Default cleanup must not remove those records.
+        */Library/Application\ Support/Codex | */Library/Application\ Support/Codex/* | \
+            */Library/Logs/com.openai.codex | */Library/Logs/com.openai.codex/* | \
+            */.codex/sessions | */.codex/sessions/* | \
+            */.codex/auth.json | */.codex/history.jsonl | \
+            */.codex/state_*.sqlite | */.codex/logs_*.sqlite | \
+            */.codex/session_index.jsonl | */.codex/cache/session_index.jsonl | \
+            */.codex/cache/codex_app_directory | */.codex/cache/codex_app_directory/*)
+            return 0
+            ;;
+        # Bluetooth and WiFi configurations
+        */ByHost/com.apple.bluetooth.* | */ByHost/com.apple.wifi.*)
+            return 0
+            ;;
+        # NetworkExtension stores VPN tunnel state and provider preferences.
+        */Library/Preferences/com.apple.networkextension*.plist)
+            return 0
+            ;;
+        # iCloud Drive - protect user's cloud synced data
+        */Library/Mobile\ Documents* | */Mobile\ Documents*)
+            return 0
+            ;;
+        # High-risk cleanup denylist: these cache/preferences paths are known
+        # to contain license, account, plugin, MDM, or system-service state
+        # despite cache-like names. Keep this as a protection overlay only; it
+        # is not a cleanup allowlist.
+        */Library/Accounts | */Library/Accounts/* | \
+            */Library/Keychains | */Library/Keychains/* | \
+            */Library/Mail | */Library/Mail/* | \
+            */Library/Calendars | \
+            */Library/Contacts | */Library/Contacts/*)
+            return 0
+            ;;
+        /Library/Audio/Plug-Ins/Components | /Library/Audio/Plug-Ins/Components/* | \
+            /Library/Audio/Plug-Ins/VST | /Library/Audio/Plug-Ins/VST/* | \
+            /Library/Audio/Plug-Ins/VST3 | /Library/Audio/Plug-Ins/VST3/* | \
+            /Library/Application\ Support/iZotope | /Library/Application\ Support/iZotope/* | \
+            */Library/Application\ Support/iZotope | */Library/Application\ Support/iZotope/* | \
+            /Library/Application\ Support/LaserSoft\ Imaging | /Library/Application\ Support/LaserSoft\ Imaging/*)
+            return 0
+            ;;
+        */Library/Preferences/com.native-instruments* | \
+            */Library/Preferences/com.avid.mediacomposer*.plist | \
+            */Library/Preferences/com.fabfilter.*.[0-9].plist | \
+            */Library/Preferences/com.fabfilter.*.[0-9][0-9].plist | \
+            */Library/Preferences/com.paceap.*.plist)
+            return 0
+            ;;
+        /private/var/folders/*/C/com.native-instruments* | \
+            /private/var/folders/*/C/com.avid.mediacomposer* | \
+            /private/var/folders/*/C/com.paceap.eden.iLokLicenseManager*)
+            return 0
+            ;;
+        */Library/Caches/ms-playwright | */Library/Caches/ms-playwright/* | \
+            */Library/Caches/app.cotypist.Cotypist | */Library/Caches/app.cotypist.Cotypist/* | \
+            */Library/Caches/com.displaylink.DisplayLinkUserAgent | */Library/Caches/com.displaylink.DisplayLinkUserAgent/* | \
+            */Library/Caches/com.lasersoft-imaging.SilverFast9 | */Library/Caches/com.lasersoft-imaging.SilverFast9/* | \
+            */Library/Caches/com.lasersoft-imaging.SilverFast-9-Installer | */Library/Caches/com.lasersoft-imaging.SilverFast-9-Installer/* | \
+            */Library/Caches/Adobe\ * | \
+            */Library/Caches/*\ Adobe* | \
+            */Library/Caches/com.apple.containermanagerd | */Library/Caches/com.apple.containermanagerd/* | \
+            */Library/Caches/com.apple.homed | */Library/Caches/com.apple.homed/* | \
+            */Library/Caches/com.apple.ap.adprivacyd | */Library/Caches/com.apple.ap.adprivacyd/* | \
+            */Library/Caches/FamilyCircle | */Library/Caches/FamilyCircle/* | \
+            */Library/Caches/com.apple.HomeKit | */Library/Caches/com.apple.HomeKit/* | \
+            */Library/Caches/com.apple.WorkflowKit.BackgroundShortcutRunner.ShortcutsSandboxCache | */Library/Caches/com.apple.WorkflowKit.BackgroundShortcutRunner.ShortcutsSandboxCache/* | \
+            */Library/Caches/com.apple.siriactionsd.ShortcutsSandboxCache | */Library/Caches/com.apple.siriactionsd.ShortcutsSandboxCache/*)
+            return 0
+            ;;
+        # Wallpaper and aerial screen saver assets are user-selected content.
+        # Their download-time mtime does not indicate whether they are active,
+        # and deleting them forces a large re-download and selection reset.
+        */Library/Application\ Support/com.apple.idleassetsd | */Library/Application\ Support/com.apple.idleassetsd/* | \
+            */Library/Application\ Support/com.apple.wallpaper | */Library/Application\ Support/com.apple.wallpaper/*)
+            return 0
+            ;;
+        # CoreAudio and audio subsystem caches (issue #553)
+        # Cleaning these can cause audio output loss on Intel Macs
+        *com.apple.coreaudio* | *com.apple.audio.* | *coreaudiod*)
+            return 0
+            ;;
+    esac
+
+    # 6. Match full path against protected patterns
+    # This catches things like /Users/tw93/Library/Caches/Claude when pattern is *Claude*
+    # Skip for container cache/tmp paths: bundle ID was already checked in step 3,
+    # and critical containers are caught by steps 1/4/5.
+    if [[ "$_container_cache_path" != "true" && "$_known_rebuildable_cache_path" != "true" ]]; then
+        if [[ "${MOLE_UNINSTALL_MODE:-0}" == "1" ]]; then
+            # Uninstall mode: first check if it's an uninstallable Apple app
+            for pattern in "${APPLE_UNINSTALLABLE_APPS[@]}"; do
+                if bundle_matches_pattern "$path" "$pattern"; then
+                    return 1 # Can be uninstalled
+                fi
+            done
+            # Then check system-critical components
+            for pattern in "${SYSTEM_CRITICAL_BUNDLES[@]}"; do
+                if bundle_matches_pattern "$path" "$pattern"; then
+                    return 0
+                fi
+            done
+        else
+            # Normal mode (cleanup): protect both system-critical and data-protected bundles
+            for pattern in "${SYSTEM_CRITICAL_BUNDLES[@]}" "${DATA_PROTECTED_BUNDLES[@]}"; do
+                if bundle_matches_pattern "$path" "$pattern"; then
+                    return 0
+                fi
+            done
+        fi
+
+        # 7. Check if the filename itself matches any protected patterns
+        # Skip in uninstall mode - user explicitly chose to remove this app
+        if [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]]; then
+            local filename="${path##*/}"
+            if should_protect_data "$filename"; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+# Check if a path is protected by whitelist patterns
+# Args: $1 - path to check
+# Returns: 0 if whitelisted, 1 if not
+is_path_whitelisted() {
+    local target_path="$1"
+    [[ -z "$target_path" ]] && return 1
+
+    # Normalize path (remove trailing slash, collapse consecutive slashes).
+    # Callers sometimes concat a glob expansion that already ends in `/`
+    # with a sub-path that begins with `/`, producing `.../Default//Service
+    # Worker/...`. Without collapsing, those never match a whitelist entry
+    # written with single separators. See #724.
+    #
+    # Note: on bash 3.2 (macOS default), `${var//\/\//\/}` leaves a literal
+    # backslash in the replacement. Indirect variables sidestep that.
+    local _slash_single="/"
+    local _slash_double="//"
+    local normalized_target="${target_path%/}"
+    while [[ "$normalized_target" == *"$_slash_double"* ]]; do
+        normalized_target="${normalized_target//$_slash_double/$_slash_single}"
+    done
+
+    # Empty whitelist means nothing is protected
+    [[ ${#WHITELIST_PATTERNS[@]} -eq 0 ]] && return 1
+
+    for pattern in "${WHITELIST_PATTERNS[@]}"; do
+        # Pattern is already expanded/normalized in bin/clean.sh
+        local check_pattern="${pattern%/}"
+        while [[ "$check_pattern" == *"$_slash_double"* ]]; do
+            check_pattern="${check_pattern//$_slash_double/$_slash_single}"
+        done
+        local has_glob="false"
+        case "$check_pattern" in
+            *\** | *\?* | *\[*)
+                has_glob="true"
+                ;;
+        esac
+
+        # Check for exact match or glob pattern match
+        # shellcheck disable=SC2053
+        if [[ "$normalized_target" == "$check_pattern" ]] ||
+            [[ "$normalized_target" == $check_pattern ]]; then
+            return 0
+        fi
+
+        # Check if target is a parent directory of a whitelisted path
+        # e.g., if pattern is /path/to/dir/subdir and target is /path/to/dir,
+        # the target should be protected to preserve its whitelisted children
+        if [[ "$check_pattern" == "$normalized_target"/* ]]; then
+            return 0
+        fi
+
+        # Check if target is a child of a whitelisted directory path
+        if [[ "$has_glob" == "false" && "$normalized_target" == "$check_pattern"/* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
