@@ -332,13 +332,14 @@ struct MaintenanceServiceTests {
         let application = ps.directory.appendingPathComponent("Test.app")
         try FileManager.default.createDirectory(at: application, withIntermediateDirectories: false)
         for code in [0, 1] {
-            let lsof = try BridgeFixture("printf 'p123\\nf166\\nn/tmp/fixture/cache\\n'; exit \(code)")
+            let lsof = try BridgeFixture("/bin/cat \"${0}.response\"; exit \(code)")
             defer { lsof.remove() }
+            try Data("p123\0cOther\0\nf166\0ar\0l \0tREG\0n\(application.path)/fixture\0\n".utf8).write(to: lsof.response)
             do {
                 try await RuntimeInspectionService(psExecutable: ps.script, lsofExecutable: lsof.script).inspect(applicationPath: application.path, targetPath: "/tmp/fixture/cache")
                 Issue.record("有效占用记录不能当作空闲")
             } catch let error as MaintenanceError {
-                #expect(error.localizedDescription.contains("仍有打开文件"))
+                #expect(error.localizedDescription.contains("进程占用"))
             }
         }
         for output in ["p123\nn/tmp/fixture/cache\n", "p123\nf166\n", "p123\nf166\nn/tmp/fixture/cache\nf167\n", "p123\nf166\nn/tmp/fixture/cache\np456\n"] {

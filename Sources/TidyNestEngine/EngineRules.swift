@@ -71,8 +71,11 @@ struct EngineContext: Sendable {
             }
             return catalog.sorted { $0.path < $1.path }
         }, runtime: { app, path in
-            let running = await MainActor.run { NSWorkspace.shared.runningApplications.contains { $0.bundleURL?.path == app.path || $0.bundleIdentifier?.caseInsensitiveCompare(app.bundleID) == .orderedSame } }
-            guard !running else { throw EngineFailure("应用仍在运行，请退出后重新生成计划。") }
+            let running = await MainActor.run {
+                NSWorkspace.shared.runningApplications.first { $0.bundleURL?.path == app.path || $0.bundleIdentifier?.caseInsensitiveCompare(app.bundleID) == .orderedSame }
+                    .map { "「\($0.localizedName ?? app.name)」（PID \($0.processIdentifier)）仍在运行，请退出后点击「重新检查」。" }
+            }
+            if let running { throw EngineFailure(running) }
             try await RuntimeInspectionService().inspect(applicationPath: app.path, targetPath: path, originalApplicationPath: app.originalPath)
         }, trash: { url in
             var resulting: NSURL?
