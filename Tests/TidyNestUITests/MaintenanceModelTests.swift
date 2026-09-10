@@ -1,11 +1,99 @@
 import Foundation
 import XCTest
-import TidyNestCore
+@testable import TidyNestCore
 import TidyNestProtocol
 @testable import TidyNest
 
 @MainActor
 final class MaintenanceModelTests: XCTestCase {
+    func testSystemAuthorizationApplicationCanToggleAndOnlyExecuteAfterConfirmation() async {
+        let body = MaintenanceItem(itemID: "authorized-body", ruleID: "mole.application.bundle.v1", path: "/fixture/Authorized.app", displayName: "Authorized", kind: .application, action: .trashItem, estimatedBytes: 20, reason: "应用本体", impact: "移入废纸篓", selection: .required, blockedReason: nil, dependsOnItemIDs: [], requiresAuthorization: true)
+        let plan = fixturePlan(kind: .uninstall, items: [body])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }, apply: { _, _, _ in
+            XCTFail("查看计划、勾选和取消确认不能请求授权或移除")
+            throw FixtureError.failed
+        }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        XCTAssertTrue(model.canSelect(body))
+        XCTAssertTrue(model.canConfirm)
+        model.setSelected(body.itemID, selected: false)
+        XCTAssertFalse(model.canConfirm)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        model.setSelected(body.itemID, selected: true)
+        model.requestConfirmation()
+        XCTAssertEqual(model.confirmation?.items.first?.requiresAuthorization, true)
+        model.dismissConfirmation()
+        XCTAssertNil(model.confirmation)
+        XCTAssertEqual(model.selectedItemIDs, [body.itemID])
+    }
+
+    func testRecheckingApplicationReplacesOldPlanAndKeepsExactTarget() async {
+        let application = MoleApplication(name: "Fixture", bundleIdentifier: "org.example.chosen", source: "App", uninstallName: "Fixture", path: "/fixture/Chosen.app", displaySize: "1 MB")
+        let other = MoleApplication(name: "Other", bundleIdentifier: "org.example.other", source: "App", uninstallName: "Other", path: "/fixture/Other.app", displaySize: "2 MB")
+        let requests = RecheckRequests()
+        let model = MaintenanceModel(actions: fixtureActions(uninstall: { app, _ in
+            let count = await requests.record(app)
+            return fixturePlan(kind: .uninstall, items: [fixtureItem("body", selection: count == 1 ? .blocked : .required, kind: .application)])
+        }, apply: { _, _, _ in XCTFail("重新检查不得执行移除"); throw FixtureError.failed }))
+        model.recheckApplication()
+        XCTAssertEqual(model.phase, .idle)
+        model.planUninstall(application)
+        await model.waitForCurrentOperation()
+        XCTAssertEqual(model.plan?.items.first?.selection, .blocked)
+        model.recheckApplication()
+        XCTAssertEqual(model.phase, .scanning)
+        XCTAssertNil(model.plan)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        model.planUninstall(other)
+        model.recheckApplication()
+        await model.waitForCurrentOperation()
+        let recorded = await requests.applications
+        XCTAssertEqual(recorded, [application, application])
+        XCTAssertEqual(model.plan?.items.first?.selection, .required)
+        XCTAssertEqual(model.selectedItemIDs, ["body"])
+        XCTAssertNil(model.confirmation)
+        XCTAssertNil(model.result)
+        model.requestConfirmation()
+        XCTAssertNotNil(model.confirmation)
+        model.recheckApplication()
+        XCTAssertNil(model.confirmation, "旧确认不能沿用到重新检查的计划")
+        await model.waitForCurrentOperation()
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        let before = await requests.applications.count
+        model.recheckApplication()
+        await model.waitForCurrentOperation()
+        let after = await requests.applications.count
+        XCTAssertEqual(after, before, "转为清理后不能仍然重检旧应用")
+        XCTAssertEqual(model.plan?.kind, .clean)
+    }
+
+    func testFailedApplicationCheckCanRetryButBusyAndStoppedRequestsCannot() async {
+        let application = MoleApplication(name: "Fixture", bundleIdentifier: "org.example.chosen", source: "App", uninstallName: "Fixture", path: "/fixture/Chosen.app", displaySize: "1 MB")
+        let requests = RecheckRequests()
+        let model = MaintenanceModel(actions: fixtureActions(uninstall: { app, _ in
+            let count = await requests.record(app)
+            if count == 1 { throw FixtureError.failed }
+            return fixturePlan(kind: .uninstall)
+        }))
+        model.planUninstall(application)
+        await model.waitForCurrentOperation()
+        guard case .failed = model.phase else { return XCTFail("首次检查应失败") }
+        model.canStartRequest = { false }
+        model.recheckApplication()
+        await model.waitForCurrentOperation()
+        let rejected = await requests.applications.count
+        XCTAssertEqual(rejected, 1)
+        model.canStartRequest = { true }
+        model.recheckApplication()
+        model.recheckApplication()
+        await model.waitForCurrentOperation()
+        let recorded = await requests.applications
+        XCTAssertEqual(recorded, [application, application])
+        XCTAssertEqual(model.phase, .ready)
+    }
+
     func testCleanScanStartsWithNoOptionalSelections() async {
         let model = MaintenanceModel(actions: fixtureActions())
         model.scanClean()
@@ -19,16 +107,56 @@ final class MaintenanceModelTests: XCTestCase {
         XCTAssertFalse(model.canConfirm)
     }
 
-    func testRequiredApplicationCannotBeUncheckedAndBlockedRemainsUnselected() async {
-        let plan = fixturePlan(kind: .uninstall, items: [fixtureItem("app", selection: .required, kind: .application), fixtureItem("cache", dependencies: ["app"]), fixtureItem("blocked", selection: .blocked)])
+    func testRequiredApplicationCanBeUncheckedWithoutAuthorizingResidualsAlone() async {
+        let body = fixtureItem("app", selection: .required, kind: .application)
+        let plan = fixturePlan(kind: .uninstall, items: [body, fixtureItem("cache", dependencies: ["app"]), fixtureItem("blocked", selection: .blocked)])
         let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
         model.scanClean()
         await model.waitForCurrentOperation()
         XCTAssertEqual(model.selectedItemIDs, ["app"])
+        XCTAssertTrue(model.canSelect(body))
         model.setSelected("app", selected: false)
         model.setSelected("blocked", selected: true)
         model.setSelected("cache", selected: true)
-        XCTAssertEqual(model.selectedItemIDs, ["app", "cache"])
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        XCTAssertFalse(model.canConfirm)
+        XCTAssertEqual(model.plan?.items.first?.selection, .required, "只改变界面选择，执行仍要求本体与依赖完整")
+        model.setSelected("app", selected: true)
+        XCTAssertEqual(model.selectedItemIDs, ["app"])
+        XCTAssertTrue(model.canConfirm)
+        model.canStartRequest = { false }
+        model.setSelected("app", selected: false)
+        XCTAssertEqual(model.selectedItemIDs, ["app"], "忙碌期间仍不能改变选择")
+    }
+
+    func testUncheckingApplicationClearsSelectedResidualsAndOldConfirmation() async {
+        let plan = fixturePlan(kind: .uninstall, items: [
+            fixtureItem("app", selection: .required, kind: .application),
+            fixtureItem("cache", dependencies: ["app"]),
+            fixtureItem("log", dependencies: ["app"])
+        ])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }, apply: { _, _, _ in
+            XCTFail("取消本体后不能执行旧确认")
+            throw FixtureError.failed
+        }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.setSelected("cache", selected: true)
+        model.setSelected("log", selected: true)
+        model.requestConfirmation()
+        XCTAssertEqual(Set(model.confirmation?.itemIDs ?? []), ["app", "cache", "log"])
+        model.setSelected("app", selected: false)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        XCTAssertNil(model.confirmation)
+        XCTAssertEqual(model.selectedBytes, 0)
+        XCTAssertFalse(model.canConfirm)
+        model.confirmExecution()
+        await model.waitForCurrentOperation()
+        XCTAssertNil(model.result)
+        model.setSelected("app", selected: true)
+        XCTAssertEqual(model.selectedItemIDs, ["app"], "重新选择本体时不自动恢复相关文件")
+        model.requestConfirmation()
+        XCTAssertEqual(model.confirmation?.itemIDs, ["app"])
     }
 
     func testSelectingDependencyWithoutParentIsRejectedAndRemovingParentDropsDependents() async {
@@ -292,13 +420,14 @@ private enum FixtureError: Error { case failed }
 
 private func fixtureActions(
     scan: @escaping @Sendable (@escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenancePlan = { _ in fixturePlan() },
+    uninstall: (@Sendable (MoleApplication, @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenancePlan)? = nil,
     apply: @escaping @Sendable (String, [String], @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenanceResult = { _, _, _ in fixtureResult() },
     history: @escaping @Sendable () async throws -> [MaintenanceResult] = { [] }
 ) -> MaintenanceActions {
     MaintenanceActions(
         capabilities: { EngineCapabilities(schemaVersion: 1, engineVersion: "fixture", engineDigest: "fixture", rulesVersion: "fixture", supportedRuleIDs: ["cache"], supportedActions: [.trashItem]) },
         scanClean: scan,
-        planUninstall: { _, callback in try await scan(callback) },
+        planUninstall: uninstall ?? { _, callback in try await scan(callback) },
         apply: apply,
         history: history,
         protections: { [] },
@@ -350,4 +479,9 @@ private actor ApplyGate {
 private actor MaintenanceApplicationQueries {
     private(set) var count = 0
     func next() -> [MoleApplication] { count += 1; return [] }
+}
+
+private actor RecheckRequests {
+    private(set) var applications: [MoleApplication] = []
+    func record(_ application: MoleApplication) -> Int { applications.append(application); return applications.count }
 }

@@ -48,6 +48,7 @@ struct MaintenanceConfirmation: Identifiable {
 final class MaintenanceModel {
     private(set) var phase: MaintenancePhase = .idle
     private(set) var plan: MaintenancePlan?
+    private(set) var plannedApplication: MoleApplication?
     private(set) var planExpired = false
     private(set) var selectedItemIDs: Set<String> = []
     private(set) var confirmation: MaintenanceConfirmation?
@@ -100,7 +101,8 @@ final class MaintenanceModel {
     }
 
     func canSelect(_ item: MaintenanceItem) -> Bool {
-        canStart && !planExpired && item.selection == .optional && Set(item.dependsOnItemIDs).isSubset(of: selectedItemIDs)
+        // “必选”约束执行清单，不应禁止用户撤回本次选择。
+        canStart && !planExpired && item.selection != .blocked && Set(item.dependsOnItemIDs).isSubset(of: selectedItemIDs)
     }
 
     func setSelected(_ id: String, selected: Bool) {
@@ -122,8 +124,14 @@ final class MaintenanceModel {
     func scanClean() { startPlan(application: nil) }
     func planUninstall(_ application: MoleApplication) { startPlan(application: application) }
 
+    func recheckApplication() {
+        guard let application = plannedApplication else { return }
+        startPlan(application: application)
+    }
+
     private func startPlan(application: MoleApplication?) {
         guard let id = begin() else { return }
+        plannedApplication = application
         plan = nil
         confirmation = nil
         selectedItemIDs = []
