@@ -22,9 +22,24 @@ struct DiskView: View {
                     Button(action: model.goUp) { Image(systemName: "arrow.up") }
                         .help("返回上层文件夹").disabled(!model.canAnalyzeDisk || directory.path == "/")
                         .accessibilityLabel("返回上层文件夹")
-                    Image(systemName: "folder.fill").foregroundStyle(NestStyle.green)
-                    Text(directory.path).font(.callout).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                    Spacer(minLength: 8)
+                    Menu {
+                        ForEach(ancestorDirectories(of: directory), id: \.path) { ancestor in
+                            Button(ancestor.path == "/" ? "根目录 /" : ancestor.lastPathComponent) {
+                                model.analyze(directory: ancestor)
+                            }
+                            .help(ancestor.path)
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis").frame(width: 24, height: 28)
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .help("选择任意上层文件夹").accessibilityLabel("跳转到上层文件夹")
+                    .disabled(!model.canAnalyzeDisk || directory.path == "/")
+                    GeometryReader { geometry in
+                        DiskPathControl(directory: directory, isEnabled: model.canAnalyzeDisk, navigate: model.analyze)
+                            .frame(width: geometry.size.width, height: 28)
+                    }
+                    .frame(height: 28)
                     Button { model.analyze(directory: directory) } label: { Image(systemName: "arrow.clockwise") }
                         .help("重新读取").accessibilityLabel("重新读取目录").disabled(!model.canAnalyzeDisk)
                     Button { model.reveal(path: directory.path) } label: { Image(systemName: "arrow.up.forward.square") }
@@ -39,6 +54,16 @@ struct DiskView: View {
                 QueryStatusView(phase: model.diskPhase, idleTitle: "空间，慢慢理清", idleMessage: "选择想查看的文件夹，了解其中的文件和子文件夹占用。", symbol: "internaldrive", cancel: model.cancelOperation)
             }
         }
+    }
+
+    private func ancestorDirectories(of directory: URL) -> [URL] {
+        var ancestors: [URL] = []
+        var current = directory
+        while current.path != "/" {
+            current = current.deletingLastPathComponent()
+            ancestors.append(current)
+        }
+        return ancestors
     }
 
     private func diskResults(_ report: MoleDiskReport) -> some View {
@@ -83,16 +108,26 @@ struct DiskView: View {
                                 }
                             }
                             .padding(.vertical, 10).tag(entry.id)
-                            .contextMenu {
-                                if entry.isDirectory {
-                                    Button("查看文件夹") { model.analyze(directory: URL(fileURLWithPath: entry.path)) }.disabled(!model.canAnalyzeDisk)
-                                }
-                                Button("在 Finder 中显示") { model.reveal(path: entry.path) }
-                            }
                         }
                     }
+                    .contextMenu(forSelectionType: String.self) { ids in
+                        if ids.count == 1, let entry = report.entries.first(where: { ids.contains($0.id) }) {
+                            if entry.isDirectory {
+                                Button("查看文件夹") { model.analyze(directory: URL(fileURLWithPath: entry.path)) }.disabled(!model.canAnalyzeDisk)
+                            }
+                            Button("在 Finder 中显示") { model.reveal(path: entry.path) }
+                        }
+                    } primaryAction: { ids in
+                        guard ids.count == 1, let entry = report.entries.first(where: { ids.contains($0.id) }),
+                              entry.isDirectory else { return }
+                        model.analyze(directory: URL(fileURLWithPath: entry.path))
+                    }
                     .listStyle(.inset).frame(minWidth: 310, idealWidth: 440)
-                    diskDetail.frame(minWidth: 260, idealWidth: 320)
+                    // 固定分栏宿主，避免选中前后的内容尺寸重新分配左右宽度。
+                    GeometryReader { geometry in
+                        diskDetail.frame(width: geometry.size.width, height: geometry.size.height)
+                    }
+                    .frame(minWidth: 260, idealWidth: 320)
                 }
             }
         }
@@ -120,7 +155,50 @@ struct DiskView: View {
                 }.controlSize(.large).padding(28).frame(maxWidth: .infinity, alignment: .leading)
             }.background(NestStyle.subtle.opacity(0.5))
         } else {
-            NestEmptyState(symbol: "doc.text.magnifyingglass", title: "查看项目详情", message: "选择一个项目，或点击文件夹右侧箭头继续查看。")
+            NestEmptyState(symbol: "doc.text.magnifyingglass", title: "查看项目详情", message: "单击查看详情，双击文件夹或点击右侧箭头进入。")
+        }
+    }
+}
+
+// 使用系统路径控件处理层级收拢与键盘操作，跳转仍复用原有只读查询。
+private struct DiskPathControl: NSViewRepresentable {
+    let directory: URL
+    let isEnabled: Bool
+    let navigate: (URL) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSPathControl {
+        let control = NSPathControl()
+        control.pathStyle = .standard
+        control.backgroundColor = .clear
+        control.isEditable = false
+        control.target = context.coordinator
+        control.action = #selector(Coordinator.selectDirectory(_:))
+        control.setAccessibilityLabel("文件夹路径")
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return control
+    }
+
+    func updateNSView(_ control: NSPathControl, context: Context) {
+        context.coordinator.parent = self
+        if control.url != directory {
+            control.url = directory
+            // 更早的层级可从菜单直达，避免深路径在窄窗口中挤成一排图标。
+            if control.pathItems.count > 4 { control.pathItems = Array(control.pathItems.suffix(4)) }
+        }
+        control.isEnabled = isEnabled
+        control.toolTip = directory.path + "\n点按上层文件夹可直接返回"
+    }
+
+    @MainActor final class Coordinator: NSObject {
+        var parent: DiskPathControl
+        init(_ parent: DiskPathControl) { self.parent = parent }
+
+        @objc func selectDirectory(_ control: NSPathControl) {
+            guard control.isEnabled, let directory = control.clickedPathItem?.url,
+                  directory.standardizedFileURL != parent.directory.standardizedFileURL else { return }
+            parent.navigate(directory)
         }
     }
 }

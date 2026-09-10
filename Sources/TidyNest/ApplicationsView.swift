@@ -27,7 +27,11 @@ struct ApplicationsView: View {
             if !model.applications.isEmpty {
                 HSplitView {
                     applicationList.frame(minWidth: 310, idealWidth: 410)
-                    applicationDetail.frame(minWidth: 285, idealWidth: 360)
+                    // 固定分栏宿主，避免空态与应用详情切换时重新分配宽度。
+                    GeometryReader { geometry in
+                        applicationDetail.frame(width: geometry.size.width, height: geometry.size.height)
+                    }
+                    .frame(minWidth: 285, idealWidth: 360)
                 }
             } else if model.hasApplicationSnapshot {
                 NestEmptyState(symbol: "square.grid.2x2", title: model.applicationsPhase == .loaded ? "没有找到应用" : "上次列表为空", message: model.applicationsPhase == .loaded ? "Mole 本次未返回应用。你可以稍后刷新列表。" : "列表更新后会在这里显示应用。")
