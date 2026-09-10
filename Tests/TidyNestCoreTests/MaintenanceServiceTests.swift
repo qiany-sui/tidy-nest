@@ -6,6 +6,67 @@ import TidyNestProtocol
 
 @Suite(.serialized)
 struct MaintenanceServiceTests {
+
+    @Test func unknownWrappedApplicationIdentifierIsResolvedForEveryPlanRequest() async throws {
+        let fixture = try BridgeFixture("/bin/cat > \"${0}.request\"\n/bin/cat \"${0}.response\"")
+        defer { fixture.remove() }
+        let app = try fixture.planApplication()
+        let service = MaintenanceService(executableURL: fixture.script)
+        for identifier in ["org.example.Wrapped", "org.example.Updated"] {
+            let info = app.path + "/Wrapper/CloudGame.app/Info.plist"
+            try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": identifier, "CFBundleDisplayName": "云·测试"], format: .binary, options: 0).write(to: URL(fileURLWithPath: info))
+            let plan = try await service.planUninstall(application: app) { _ in }
+            let request = try fixture.planRequest()
+            #expect(plan.kind == .uninstall)
+            #expect(request.appPath == app.path, "必须检查选中的整个外层应用包")
+            #expect(request.expectedBundleID == identifier, "首次检查和重检都不能再发送缓存中的 unknown")
+            #expect(request.confirmed == nil)
+            #expect(request.selectedItemIDs == nil)
+        }
+    }
+
+    @Test func knownApplicationIdentifierIsNeverSilentlyReplacedDuringPlanRequest() async throws {
+        let fixture = try BridgeFixture("/bin/cat > \"${0}.request\"\n/bin/cat \"${0}.response\"")
+        defer { fixture.remove() }
+        let app = try fixture.planApplication(identifier: "org.example.Previous")
+        _ = try await MaintenanceService(executableURL: fixture.script).planUninstall(application: app) { _ in }
+        let request = try fixture.planRequest()
+        #expect(request.appPath == app.path)
+        #expect(request.expectedBundleID == "org.example.Previous", "真实标识冲突必须留给引擎拦截")
+    }
+
+    @Test(arguments: ["missing", "corrupt", "escape"])
+    func unknownApplicationReadFailureDoesNotLaunchPlanBridge(_ kind: String) async throws {
+        let fixture = try BridgeFixture("/bin/cat > \"${0}.request\"\n/bin/cat \"${0}.response\"")
+        defer { fixture.remove() }
+        let app = try fixture.planApplication()
+        let info = URL(fileURLWithPath: app.path + "/Wrapper/CloudGame.app/Info.plist")
+        switch kind {
+        case "missing": try FileManager.default.removeItem(at: info)
+        case "corrupt": try Data("broken plist".utf8).write(to: info)
+        default:
+            let link = URL(fileURLWithPath: app.path + "/WrappedBundle")
+            try FileManager.default.removeItem(at: link)
+            try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "../../outside.app")
+        }
+        await #expect(throws: (any Error).self) {
+            try await MaintenanceService(executableURL: fixture.script).planUninstall(application: app) { _ in }
+        }
+        #expect(!FileManager.default.fileExists(atPath: fixture.script.path + ".request"))
+    }
+
+    @Test func cancelledUnknownApplicationPlanDoesNotLaunchBridge() async throws {
+        let fixture = try BridgeFixture("/bin/cat > \"${0}.request\"\n/bin/cat \"${0}.response\"")
+        defer { fixture.remove() }
+        let app = try fixture.planApplication()
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await MaintenanceService(executableURL: fixture.script).planUninstall(application: app) { _ in }
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(!FileManager.default.fileExists(atPath: fixture.script.path + ".request"))
+    }
+
     @Test func fileCandidatesCannotRequestSystemAuthorization() async throws {
         var event = finalPlan()
         var plan = event["plan"] as! [String: Any]
@@ -431,6 +492,24 @@ private struct BridgeFixture: Sendable {
         try Data(("#!/bin/sh\n" + body + "\n").utf8).write(to: script)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
     }
+
+    func planApplication(identifier: String = "unknown") throws -> MoleApplication {
+        let app = directory.appendingPathComponent("云·测试 应用.app")
+        let payload = app.appendingPathComponent("Wrapper/CloudGame.app")
+        try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.example.Wrapped"], format: .binary, options: 0).write(to: payload.appendingPathComponent("Info.plist"))
+        try FileManager.default.createSymbolicLink(atPath: app.appendingPathComponent("WrappedBundle").path, withDestinationPath: "Wrapper/CloudGame.app")
+        var event = finalPlan()
+        var plan = event["plan"] as! [String: Any]
+        plan["kind"] = "uninstall"
+        event["plan"] = plan
+        try events([progress(), event]).write(to: response)
+        return MoleApplication(name: "云·测试", bundleIdentifier: identifier, source: "App", uninstallName: "云·测试", path: app.path, displaySize: "未知")
+    }
+    func planRequest() throws -> MaintenanceRequest {
+        try MaintenanceJSON.decoder().decode(MaintenanceRequest.self, from: Data(contentsOf: URL(fileURLWithPath: script.path + ".request")))
+    }
+
     func waitUntilReady() async throws {
         for _ in 0..<200 {
             if FileManager.default.fileExists(atPath: script.path + ".ready") { return }

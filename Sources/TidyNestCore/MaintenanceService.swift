@@ -36,13 +36,13 @@ public final class MaintenanceService: @unchecked Sendable {
     }
 
     public func scanClean(onEvent: @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenancePlan {
-        try await scan(command: "scan-clean", request: MaintenanceRequest(), kind: .clean, onEvent: onEvent)
+        try await scan(command: "scan-clean", kind: .clean, onEvent: onEvent)
     }
 
     public func planUninstall(application: MoleApplication, onEvent: @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenancePlan {
         try MaintenanceValidation.path(application.path)
         guard !application.bundleIdentifier.isEmpty else { throw MaintenanceError.invalidResponse("缺少应用标识。") }
-        return try await scan(command: "plan-uninstall", request: MaintenanceRequest(appPath: application.path, expectedBundleID: application.bundleIdentifier), kind: .uninstall, onEvent: onEvent)
+        return try await scan(command: "plan-uninstall", application: application, kind: .uninstall, onEvent: onEvent)
     }
 
     public func apply(planID: String, selectedItemIDs: [String], onEvent: @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenanceResult {
@@ -154,9 +154,19 @@ public final class MaintenanceService: @unchecked Sendable {
         return paths
     }
 
-    private func scan(command: String, request: MaintenanceRequest, kind: MaintenanceKind, onEvent: @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenancePlan {
+    private func scan(command: String, application: MoleApplication? = nil, kind: MaintenanceKind, onEvent: @escaping @Sendable (MaintenanceEvent) -> Void) async throws -> MaintenancePlan {
         let control = try begin()
         defer { end() }
+        try Task.checkCancellation()
+        var request = MaintenanceRequest()
+        if let application {
+            // Mole 会把包装应用标识记为 unknown；先安全补全，再由引擎独立核验。
+            // 已有真实标识不能自动替换，避免掩盖应用身份变化。
+            let target = application.bundleIdentifier == "unknown"
+                ? try await ApplicationRefreshService().refresh(application) : application
+            request = MaintenanceRequest(appPath: target.path, expectedBundleID: target.bundleIdentifier)
+        }
+        try Task.checkCancellation()
         let stream = MaintenanceEventStream(onEvent: onEvent)
         let output = try await BridgeProcessRunner().run(executableURL: executableURL, command: command, input: Self.requestData(request), control: control, onOutput: stream.consume)
         try Task.checkCancellation()
