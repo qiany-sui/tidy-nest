@@ -13,6 +13,7 @@ private struct SavedPlan: Codable, Sendable {
     let owners: [String: EngineApplication]
     let catalogDigest: String
     let catalogRecords: [CatalogRecord]
+    let containerOwners: [String: ContainerOwnership]
 }
 private struct JournalEntry: Codable {
     let state: String
@@ -150,6 +151,7 @@ public actor MaintenanceEngine {
         var items: [MaintenanceItem] = []
         var snapshots: [String: ObjectSnapshot] = [:]
         var owners: [String: EngineApplication] = [:]
+        var containerOwners: [String: ContainerOwnership] = [:]
         let groups = Dictionary(grouping: catalog, by: { $0.bundleID.lowercased() })
         var selectedApps = catalog
         var appItemID: String?
@@ -163,7 +165,7 @@ public actor MaintenanceEngine {
             guard app.bundleID == request.expectedBundleID else {
                 // Mole 对包装应用可能返回 unknown；保留身份校验，但不能把已找到的应用误报为缺失。
                 let reason = app.unsupportedReason.map { "应用仍然存在。" + $0 }
-                    ?? "应用仍然存在，但标识与应用列表不一致。请刷新应用列表后重新检查。"
+                    ?? "应用仍然存在，但标识与应用列表不一致。请先刷新此应用，再重新检查。"
                 complete = false; issues.append(PlanIssue(path: path, reason: reason))
                 selectedApps = []
                 return finishPlan()
@@ -173,8 +175,11 @@ public actor MaintenanceEngine {
         for (index, app) in selectedApps.enumerated() {
             try checkCancelled()
             stream.send(.progress, message: "正在检查 \(app.name)（\(index + 1)/\(selectedApps.count) 个应用）")
+            let hasUniqueOwner = groups[app.bundleID.lowercased()]?.count == 1
+            let bodyOnly = !hasUniqueOwner || app.bundleID.lowercased() == EngineRules.xcodeBundleID
             var block: String?
-            if groups[app.bundleID.lowercased()]?.count != 1 { block = "bundle ID 安装归属不唯一。" }
+            // 应用本体由精确路径和完整快照定位；共享缓存与日志仍要求唯一归属。
+            if !uninstall && !hasUniqueOwner { block = "bundle ID 安装归属不唯一，共享缓存与日志已保留。" }
             if !validBundle(app.bundleID) { block = app.unsupportedReason ?? "bundle ID 不完整，不授权维护动作。" }
             if !context.appRoots.contains(where: { pathInside(app.path, $0) && app.path != $0 }) || !app.path.hasSuffix(".app") { block = "应用不在首批普通应用安装范围。" }
             block = block ?? rules.appBlock(app, clean: !uninstall)
@@ -193,16 +198,48 @@ public actor MaintenanceEngine {
                     do { snapshot = try ObjectSnapshot.capture(app.path, application: true) }
                     catch { block = error.localizedDescription }
                 }
-                let item = MaintenanceItem(itemID: id, ruleID: EngineRules.ids[2], path: app.path, displayName: app.name, kind: .application, action: .trashItem, estimatedBytes: snapshot?.bytes, reason: "移除选定的普通应用本体", impact: "应用将无法启动，可从废纸篓手动恢复。相关缓存与日志单独选择。", selection: block == nil ? .required : .blocked, blockedReason: block, dependsOnItemIDs: [])
+                let item = MaintenanceItem(itemID: id, ruleID: EngineRules.ids[2], path: app.path, displayName: app.name, kind: .application, action: .trashItem, estimatedBytes: snapshot?.bytes, reason: app.isWrapped ? "移除选定的 iPhone/iPad 包装应用本体（整个外层应用包）" : "移除选定的普通应用本体", impact: bodyOnly ? "只移除当前路径的应用本体，缓存与日志保留；可从废纸篓手动恢复。" : (app.isWrapped ? "应用将无法启动，可从废纸篓手动恢复。文稿、存档、偏好设置及共享容器保留；缓存与日志单独选择。" : "应用将无法启动，可从废纸篓手动恢复。相关缓存与日志单独选择。"), selection: block == nil ? .required : .blocked, blockedReason: block, dependsOnItemIDs: [])
                 items.append(item); owners[id] = app
                 if let snapshot { snapshots[id] = snapshot }
             }
             if let block { issues.append(PlanIssue(path: app.path, reason: block)); continue }
+            if uninstall && bodyOnly {
+                let reason = hasUniqueOwner
+                    ? "当前仅支持移除 Xcode 应用本体，缓存与日志保留。"
+                    : "检测到多个使用相同 Bundle ID 的应用。本计划仅移除所选路径的应用本体，共享缓存与日志已保留。"
+                issues.append(PlanIssue(path: app.path, reason: reason))
+                continue
+            }
             for (folder, rule) in [("Caches", EngineRules.ids[0]), ("Logs", EngineRules.ids[1])] {
                 let root = context.home + "/Library/" + folder + "/" + app.bundleID
                 if try existingIdentity(root) == nil { continue }
                 do { try enumerate(root, app: app, rule: rule, dependencies: appItemID.map { [$0] } ?? []) }
                 catch { complete = false; issues.append(PlanIssue(path: root, reason: "枚举不完整：" + error.localizedDescription)) }
+            }
+            if app.isWrapped {
+                let container: ContainerOwnership?
+                do { container = try ContainerOwnership.discover(home: context.home, bundleID: app.bundleID, checkCancelled: checkCancelled) }
+                catch {
+                    if error is CancellationError { throw error }
+                    // 容器尚未获授权时保留全部容器数据，不阻止已独立核验的应用本体。
+                    issues.append(PlanIssue(path: context.home + "/Library/Containers", reason: "容器缓存与日志已保留：" + error.localizedDescription))
+                    continue
+                }
+                guard let container else {
+                    issues.append(PlanIssue(path: context.home + "/Library/Containers", reason: "未找到可确认归属的应用容器，容器数据保留；文稿、存档和共享容器不在处理范围。"))
+                    continue
+                }
+                containerOwners[app.path] = container
+                for (folder, rule) in [("Caches", EngineRules.ids[3]), ("Logs", EngineRules.ids[4])] {
+                    let root = container.path + "/Data/Library/" + folder
+                    do {
+                        if try existingIdentity(root) == nil { continue }
+                        try enumerate(root, app: app, rule: rule, dependencies: appItemID.map { [$0] } ?? [])
+                    } catch {
+                        if error is CancellationError { throw error }
+                        complete = false; issues.append(PlanIssue(path: root, reason: "容器缓存或日志枚举不完整：" + error.localizedDescription))
+                    }
+                }
             }
         }
         if !uninstall {
@@ -221,14 +258,17 @@ public actor MaintenanceEngine {
         // 枚举期间发生安装变化会使整个计划不可执行。
         do {
             guard try await catalogDigest(context.catalog()) == fingerprint else { throw EngineFailure("扫描期间安装集合发生变化。") }
+            for owner in containerOwners.values { try owner.verifyUnique(home: context.home, checkCancelled: checkCancelled) }
         } catch {
+            if error is CancellationError { throw error }
             complete = false; issues.append(PlanIssue(path: context.home, reason: error.localizedDescription))
         }
+        try checkCancelled()
         return finishPlan()
 
         func finishPlan() -> SavedPlan {
-            let plan = MaintenancePlan(schemaVersion: 1, planID: UUID().uuidString, runID: stream.runID, kind: uninstall ? .uninstall : .clean, title: uninstall ? "移除应用计划" : "缓存与日志清理计划", engineVersion: EngineRules.engineVersion, engineDigest: engineDigest, rulesVersion: EngineRules.version, configurationDigest: configuration.digest, createdAt: Date(), scopeRoots: uninstall ? selectedApps.map(\.path) : [context.home + "/Library/Caches", context.home + "/Library/Logs"], scanComplete: complete, scanIssues: issues, items: items)
-            return SavedPlan(plan: plan, snapshots: snapshots, owners: owners, catalogDigest: fingerprint, catalogRecords: catalogRecords)
+            let plan = MaintenancePlan(schemaVersion: 1, planID: UUID().uuidString, runID: stream.runID, kind: uninstall ? .uninstall : .clean, title: uninstall ? "移除应用计划" : "缓存与日志清理计划", engineVersion: EngineRules.engineVersion, engineDigest: engineDigest, rulesVersion: EngineRules.version, configurationDigest: configuration.digest, createdAt: Date(), scopeRoots: (uninstall ? selectedApps.map(\.path) : [context.home + "/Library/Caches", context.home + "/Library/Logs"]) + containerOwners.values.flatMap { [$0.path + "/Data/Library/Caches", $0.path + "/Data/Library/Logs"] }.sorted(), scanComplete: complete, scanIssues: issues, items: items)
+            return SavedPlan(plan: plan, snapshots: snapshots, owners: owners, catalogDigest: fingerprint, catalogRecords: catalogRecords, containerOwners: containerOwners)
         }
         func enumerate(_ directory: String, app: EngineApplication, rule: String, dependencies: [String]) throws {
             try checkCancelled()
@@ -257,7 +297,7 @@ public actor MaintenanceEngine {
                     }
                     guard snapshot.matches(try ObjectSnapshot.capture(path, application: false)) else { throw EngineFailure("扫描期间文件发生变化。") }
                     let id = UUID().uuidString
-                    let item = MaintenanceItem(itemID: id, ruleID: rule, path: path, displayName: name, kind: .file, action: .trashItem, estimatedBytes: snapshot.bytes, reason: "精确匹配 \(app.bundleID) 的普通\(rule == EngineRules.ids[0] ? "缓存" : "日志")文件", impact: "移入废纸篓；缓存可能重新生成，日志移走后历史排错记录不可直接读取。", selection: .optional, blockedReason: nil, dependsOnItemIDs: dependencies)
+                    let item = MaintenanceItem(itemID: id, ruleID: rule, path: path, displayName: name, kind: .file, action: .trashItem, estimatedBytes: snapshot.bytes, reason: "\([EngineRules.ids[3], EngineRules.ids[4]].contains(rule) ? "容器元数据确认归属" : "精确匹配") \(app.bundleID) 的普通\([EngineRules.ids[0], EngineRules.ids[3]].contains(rule) ? "缓存" : "日志")文件", impact: "移入废纸篓；缓存可能重新生成，日志移走后历史排错记录不可直接读取。", selection: .optional, blockedReason: nil, dependsOnItemIDs: dependencies)
                     items.append(item); snapshots[id] = snapshot; owners[id] = app
                 } catch { complete = false; issues.append(PlanIssue(path: path, reason: error.localizedDescription)) }
             }
@@ -283,12 +323,20 @@ public actor MaintenanceEngine {
         for item in plan.items {
             guard item.selection != .blocked, item.blockedReason == nil, item.action == .trashItem, UUID(uuidString: item.itemID) != nil, let owner = saved.owners[item.itemID], saved.snapshots[item.itemID] != nil, Set(item.dependsOnItemIDs).isSubset(of: selected) else { throw EngineFailure("计划项目已阻止、快照缺失或依赖未选中。") }
             _ = try canonicalPath(item.path)
+            guard saved.catalogRecords.contains(where: { $0.app == owner }) else { throw EngineFailure("项目归属未绑定到计划中的安装集合。") }
             if item.kind == .application {
                 guard plan.kind == .uninstall, item.selection == .required, item.ruleID == EngineRules.ids[2], item.path == owner.path, context.appRoots.contains(where: { pathInside(item.path, $0) && item.path != $0 }), item.path.hasSuffix(".app"), item.dependsOnItemIDs.isEmpty else { throw EngineFailure("应用计划范围不合法。") }
             } else {
-                guard item.selection == .optional, [EngineRules.ids[0], EngineRules.ids[1]].contains(item.ruleID), validBundle(owner.bundleID) else { throw EngineFailure("文件规则不合法。") }
-                let folder = item.ruleID == EngineRules.ids[0] ? "Caches" : "Logs"
-                let root = context.home + "/Library/" + folder + "/" + owner.bundleID
+                guard item.selection == .optional, [EngineRules.ids[0], EngineRules.ids[1], EngineRules.ids[3], EngineRules.ids[4]].contains(item.ruleID), validBundle(owner.bundleID) else { throw EngineFailure("文件规则不合法。") }
+                guard saved.catalogRecords.filter({ $0.app.bundleID.lowercased() == owner.bundleID.lowercased() }).count == 1,
+                      owner.bundleID.lowercased() != EngineRules.xcodeBundleID else { throw EngineFailure("共享缓存与日志或 Xcode 开发数据不在此计划的处理范围。") }
+                let folder = [EngineRules.ids[0], EngineRules.ids[3]].contains(item.ruleID) ? "Caches" : "Logs"
+                let root: String
+                if [EngineRules.ids[3], EngineRules.ids[4]].contains(item.ruleID) {
+                    guard owner.isWrapped, let container = saved.containerOwners[owner.path], container.bundleID == owner.bundleID,
+                          URL(fileURLWithPath: try canonicalPath(container.path)).deletingLastPathComponent().path == context.home + "/Library/Containers" else { throw EngineFailure("容器文件没有已确认的包装应用归属。") }
+                    root = container.path + "/Data/Library/" + folder
+                } else { root = context.home + "/Library/" + folder + "/" + owner.bundleID }
                 guard pathInside(item.path, root), item.path != root, rules.fileBlock(item.path, configuration: configuration) == nil else { throw EngineFailure("文件不在计划授权范围或已受保护。") }
                 if plan.kind == .uninstall {
                     guard item.dependsOnItemIDs.count == 1, plan.items.contains(where: { $0.itemID == item.dependsOnItemIDs[0] && $0.kind == .application && $0.path == owner.path }) else { throw EngineFailure("残留缺少应用本体依赖。") }
@@ -298,6 +346,10 @@ public actor MaintenanceEngine {
         }
         try checkCancelled()
         guard try await catalogDigest(context.catalog()) == saved.catalogDigest else { throw EngineFailure("安装集合或应用标识已变化，请重新生成计划。") }
+        let selectedContainerApps = Set(items.filter { [EngineRules.ids[3], EngineRules.ids[4]].contains($0.ruleID) }.compactMap { saved.owners[$0.itemID]?.path })
+        for appPath in selectedContainerApps {
+            try saved.containerOwners[appPath]!.verifyUnique(home: context.home, checkCancelled: checkCancelled)
+        }
         let started = Date(); let selectedBytes = items.reduce(UInt64(0)) { $0 + ($1.estimatedBytes ?? 0) }
         let accepted = MaintenanceResult(planID: planID, runID: stream.runID, title: plan.title, status: .unknown, startedAt: started, finishedAt: started, items: items.map { MaintenanceItemResult(itemID: $0.itemID, path: $0.path, outcome: .unknown, reason: "执行已接受，缺少最终记录时需核对。", trashPath: nil, retainedPath: $0.path, estimatedBytes: $0.estimatedBytes) }, selectedBytes: selectedBytes, trashedBytes: 0, freeBytesDelta: nil, message: "事务尚未完成。")
         progress.accepted = accepted
@@ -326,9 +378,10 @@ public actor MaintenanceEngine {
                         owner.originalPath = owner.path
                         owner.path = trashPath
                     }
+                    let container = [EngineRules.ids[3], EngineRules.ids[4]].contains(item.ruleID) ? saved.containerOwners[saved.owners[item.itemID]!.path] : nil
                     try await context.runtime(owner, item.path)
                     if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
-                    result = try move(item, snapshot: saved.snapshots[item.itemID]!, store: store, runID: stream.runID)
+                    result = try move(item, snapshot: saved.snapshots[item.itemID]!, container: container, store: store, runID: stream.runID)
                 } catch {
                     if error is CancellationError { cancellationObserved = true }
                     result = itemResult(item, error is CancellationError ? .cancelled : .failed, error.localizedDescription, retained: item.path)
@@ -347,7 +400,7 @@ public actor MaintenanceEngine {
         return result
     }
 
-    private func move(_ item: MaintenanceItem, snapshot: ObjectSnapshot, store: EngineStore, runID: String) throws -> MaintenanceItemResult {
+    private func move(_ item: MaintenanceItem, snapshot: ObjectSnapshot, container: ContainerOwnership?, store: EngineStore, runID: String) throws -> MaintenanceItemResult {
         guard snapshot.matches(try ObjectSnapshot.capture(item.path, application: item.kind == .application)) else { throw EngineFailure("目标、父目录或应用成员已变化，请重新生成计划。") }
         let sourceURL = URL(fileURLWithPath: item.path)
         let source = try DirectoryFD(path: sourceURL.deletingLastPathComponent().path)
@@ -361,6 +414,7 @@ public actor MaintenanceEngine {
         guard snapshot.members.first?.identity.device == destination.identities.last?.device else { throw EngineFailure("目标与私有暂存目录不在同一卷，已保留。") }
         try journal(store, runID, state: "moveIntent", item: item, retained: staged)
         try context.hook(.beforeMove, item.path, staged)
+        try container?.verifyUnique(home: context.home, checkCancelled: checkCancelled)
         // macOS 没有以源 inode 为条件的 rename；移后复验只能检测可观察到的竞争变化。
         guard renameatx_np(source.fd, sourceURL.lastPathComponent, destination.fd, sourceURL.lastPathComponent, UInt32(RENAME_EXCL)) == 0 else { throw EngineFailure("无法独占移入暂存区，源文件保留。") }
         var knownTrash: String?
@@ -375,6 +429,8 @@ public actor MaintenanceEngine {
             try journal(store, runID, state: "trashIntent", item: item, retained: staged)
             try context.hook(.beforeTrash, item.path, staged)
             guard snapshot.matches(try ObjectSnapshot.capture(staged, application: item.kind == .application), moved: true) else { throw EngineFailure("移入废纸篓前内容发生变化。") }
+            // 已暂存的当前项完成复核与记账；正常取消只停止后续项。
+            try container?.verifyUnique(home: context.home, checkCancelled: {})
             let trashURL = try context.trash(URL(fileURLWithPath: staged))
             knownTrash = trashURL.path
             try context.hook(.afterTrash, item.path, trashURL.path)

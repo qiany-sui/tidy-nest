@@ -24,6 +24,7 @@ struct FileIdentity: Codable, Equatable, Sendable {
     let device: Int32
     let inode: UInt64
     let owner: UInt32
+    let group: UInt32
     let mode: UInt16
     let links: UInt16
     let size: Int64
@@ -32,17 +33,34 @@ struct FileIdentity: Codable, Equatable, Sendable {
     let changedSeconds: Int64
     let changedNanos: Int64
     init(_ s: stat) {
-        device = s.st_dev; inode = s.st_ino; owner = s.st_uid; mode = s.st_mode
+        device = s.st_dev; inode = s.st_ino; owner = s.st_uid; group = s.st_gid; mode = s.st_mode
         links = s.st_nlink; size = s.st_size
         modifiedSeconds = Int64(s.st_mtimespec.tv_sec); modifiedNanos = Int64(s.st_mtimespec.tv_nsec)
         changedSeconds = Int64(s.st_ctimespec.tv_sec); changedNanos = Int64(s.st_ctimespec.tv_nsec)
     }
+    // 本地快照用固定顺序数组保存全部身份字段，避免大型应用重复字段名超过记录上限。
+    init(from decoder: any Decoder) throws {
+        var values = try decoder.unkeyedContainer()
+        guard values.count == 11 else { throw EngineFailure("快照身份字段不完整。") }
+        device = try values.decode(Int32.self); inode = try values.decode(UInt64.self)
+        owner = try values.decode(UInt32.self); group = try values.decode(UInt32.self); mode = try values.decode(UInt16.self)
+        links = try values.decode(UInt16.self); size = try values.decode(Int64.self)
+        modifiedSeconds = try values.decode(Int64.self); modifiedNanos = try values.decode(Int64.self)
+        changedSeconds = try values.decode(Int64.self); changedNanos = try values.decode(Int64.self)
+    }
+    func encode(to encoder: any Encoder) throws {
+        var values = encoder.unkeyedContainer()
+        try values.encode(device); try values.encode(inode); try values.encode(owner); try values.encode(group); try values.encode(mode)
+        try values.encode(links); try values.encode(size)
+        try values.encode(modifiedSeconds); try values.encode(modifiedNanos)
+        try values.encode(changedSeconds); try values.encode(changedNanos)
+    }
     var type: UInt16 { mode & UInt16(S_IFMT) }
     func sameDirectory(_ other: Self) -> Bool {
-        device == other.device && inode == other.inode && owner == other.owner && mode == other.mode
+        device == other.device && inode == other.inode && owner == other.owner && group == other.group && mode == other.mode
     }
     func sameMovedObject(_ other: Self) -> Bool {
-        device == other.device && inode == other.inode && owner == other.owner && mode == other.mode && links == other.links && size == other.size && modifiedSeconds == other.modifiedSeconds && modifiedNanos == other.modifiedNanos
+        device == other.device && inode == other.inode && owner == other.owner && group == other.group && mode == other.mode && links == other.links && size == other.size && modifiedSeconds == other.modifiedSeconds && modifiedNanos == other.modifiedNanos
     }
 }
 
@@ -126,16 +144,37 @@ struct SnapshotMember: Codable, Equatable, Sendable {
     let relativePath: String
     let identity: FileIdentity
     let linkTarget: String?
+    init(relativePath: String, identity: FileIdentity, linkTarget: String?) {
+        self.relativePath = relativePath; self.identity = identity; self.linkTarget = linkTarget
+    }
+    init(from decoder: any Decoder) throws {
+        var values = try decoder.unkeyedContainer()
+        guard values.count == 3 else { throw EngineFailure("快照成员字段不完整。") }
+        relativePath = try values.decode(String.self)
+        identity = try values.decode(FileIdentity.self)
+        linkTarget = try values.decodeIfPresent(String.self)
+    }
+    func encode(to encoder: any Encoder) throws {
+        var values = encoder.unkeyedContainer()
+        try values.encode(relativePath); try values.encode(identity); try values.encode(linkTarget)
+    }
 }
 struct ObjectSnapshot: Codable, Sendable {
     let parents: [FileIdentity]
     let members: [SnapshotMember]
-    var bytes: UInt64 { members.reduce(0) { $0 + ($1.identity.type == S_IFREG ? UInt64(max(0, $1.identity.size)) : 0) } }
+    var bytes: UInt64 {
+        var counted: Set<UInt64> = []
+        return members.reduce(0) { total, member in
+            // 包内硬链接共享同一份数据，体积只计一次；快照仍保留每个路径。
+            total + (member.identity.type == S_IFREG && counted.insert(member.identity.inode).inserted ? UInt64(max(0, member.identity.size)) : 0)
+        }
+    }
     static func capture(_ path: String, application: Bool) throws -> Self {
         let url = URL(fileURLWithPath: try canonicalPath(path))
         let parent = try DirectoryFD(path: url.deletingLastPathComponent().path)
         var members: [SnapshotMember] = []
         try walk(parent: parent.fd, name: url.lastPathComponent, relative: "", root: path, application: application, device: nil, members: &members)
+        try validateHardLinks(members)
         return Self(parents: parent.identities, members: members)
     }
     static func captureFinalLocation(_ path: String, application: Bool) throws -> Self {
@@ -157,6 +196,7 @@ struct ObjectSnapshot: Codable, Sendable {
             guard original.type == S_IFREG, original.owner == getuid(), original.links == 1, original.mode & 0o6022 == 0 else { throw EngineFailure("最终文件类型、属主、链接数或权限不符合计划。") }
             members = [SnapshotMember(relativePath: "", identity: original, linkTarget: nil)]
         }
+        try validateHardLinks(members)
         var after = stat()
         guard fstat(fd, &after) == 0, original == FileIdentity(after), members.first?.identity == original else { throw EngineFailure("最终对象在复验期间发生变化。") }
         let location = open(normalized, flags)
@@ -167,7 +207,11 @@ struct ObjectSnapshot: Codable, Sendable {
     }
     private static func walk(parent: Int32, name: String, relative: String, root: String, application: Bool, device: Int32?, members: inout [SnapshotMember]) throws {
         let info = try identity(parent: parent, name: name)
-        guard info.owner == getuid(), (info.type == S_IFLNK || info.mode & 0o022 == 0), device == nil || info.device == device else { throw EngineFailure("目标属主或卷不在当前用户范围。") }
+        // Xcode 的系统安装成员使用 root:wheel 组写；其它共享组及全员写入仍不接受。
+        let systemPackageMember = application && info.owner == 0 && info.group == 0
+        guard info.owner == getuid() || (application && info.owner == 0),
+              info.type == S_IFLNK || (info.mode & 0o6002 == 0 && (info.mode & 0o020 == 0 || systemPackageMember)),
+              device == nil || info.device == device else { throw EngineFailure("目标属主、权限或卷不在支持范围。") }
         var link: String?
         if info.type == S_IFLNK {
             guard application, !relative.isEmpty else { throw EngineFailure("目标是符号链接，已保留。") }
@@ -182,7 +226,7 @@ struct ObjectSnapshot: Codable, Sendable {
             guard pathInside(resolved, root) else { throw EngineFailure("应用包含指向包外的链接。") }
             link = target
         } else if info.type == S_IFREG {
-            guard info.links == 1, info.mode & 0o6000 == 0 else { throw EngineFailure("硬链接或特殊权限文件已保留。") }
+            guard info.links == 1 || application else { throw EngineFailure("普通缓存或日志的硬链接已保留。") }
         } else if info.type == S_IFDIR {
             guard application else { throw EngineFailure("首批规则不移动缓存目录。") }
         } else { throw EngineFailure("特殊文件不支持维护。") }
@@ -214,6 +258,16 @@ struct ObjectSnapshot: Codable, Sendable {
                 try walk(parent: fd, name: child, relative: relative.isEmpty ? child : relative + "/" + child, root: root, application: application, device: info.device, members: &members)
             }
             guard fstat(fd, &st) == 0, FileIdentity(st) == info else { throw EngineFailure("扫描时应用目录成员发生变化。") }
+        }
+    }
+    private static func validateHardLinks(_ members: [SnapshotMember]) throws {
+        // 只有同卷且所有链接都位于本包的文件才随整包移动，避免授权包外共享对象。
+        let groups = Dictionary(grouping: members.filter { $0.identity.type == S_IFREG && $0.identity.links > 1 }, by: { $0.identity.inode })
+        for group in groups.values {
+            let first = group[0].identity
+            guard group.count == Int(first.links), group.allSatisfy({ $0.identity == first }) else {
+                throw EngineFailure("应用包含包外硬链接，或链接身份在检查期间发生变化。")
+            }
         }
     }
     func matches(_ current: Self, moved: Bool = false) -> Bool {

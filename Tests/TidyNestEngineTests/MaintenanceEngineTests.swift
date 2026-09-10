@@ -17,16 +17,18 @@ private struct Fixture {
     let app: URL
     let cache: URL
     let trash: URL
-    init() throws {
+    let bundleID: String
+    init(bundleID: String = "org.example.fixture") throws {
+        self.bundleID = bundleID
         root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("work/m2-engine-fixtures/" + UUID().uuidString)
         home = root.appendingPathComponent("home")
         app = home.appendingPathComponent("Applications/Fixture.app")
-        cache = home.appendingPathComponent("Library/Caches/org.example.fixture")
+        cache = home.appendingPathComponent("Library/Caches/" + bundleID)
         trash = root.appendingPathComponent("trash")
         for url in [app.appendingPathComponent("Contents"), cache, trash] {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         }
-        let plist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.example.fixture", "CFBundleExecutable": "Fixture"], format: .xml, options: 0)
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": bundleID, "CFBundleExecutable": "Fixture"], format: .xml, options: 0)
         try plist.write(to: app.appendingPathComponent("Contents/Info.plist"))
     }
     func file(_ name: String, _ contents: String = "fixture only") throws -> URL {
@@ -35,7 +37,7 @@ private struct Fixture {
         return url
     }
     func context(hook: @escaping @Sendable (ExecutionBoundary, String, String) throws -> Void = { _, _, _ in }, runtime: @escaping @Sendable (EngineApplication, String) async throws -> Void = { _, _ in }, trashOperation: (@Sendable (URL) throws -> URL)? = nil) -> EngineContext {
-        let application = EngineApplication(path: app.path, bundleID: "org.example.fixture", name: "Fixture", source: "app")
+        let application = EngineApplication(path: app.path, bundleID: bundleID, name: "Fixture", source: "app")
         let trash = trash
         return EngineContext(home: home.path, appRoots: [home.appendingPathComponent("Applications").path], catalog: { FileManager.default.fileExists(atPath: application.path) ? [application] : [] }, runtime: runtime, trash: trashOperation ?? { source in
             let destination = trash.appendingPathComponent(UUID().uuidString + "-" + source.lastPathComponent)
@@ -241,7 +243,7 @@ private func apply(_ engine: MaintenanceEngine, _ plan: MaintenancePlan, _ ids: 
 
 private func uninstall(_ engine: MaintenanceEngine, fixture: Fixture) async throws -> MaintenancePlan {
     let box = EventBox()
-    _ = try await engine.handle(command: "plan-uninstall", request: MaintenanceRequest(appPath: fixture.app.path, expectedBundleID: "org.example.fixture"), emit: { box.append($0) })
+    _ = try await engine.handle(command: "plan-uninstall", request: MaintenanceRequest(appPath: fixture.app.path, expectedBundleID: fixture.bundleID), emit: { box.append($0) })
     return try #require(box.events.last?.plan)
 }
 
@@ -424,6 +426,230 @@ private final class MutableFlag: @unchecked Sendable {
     #expect(FileManager.default.fileExists(atPath: target.path))
 }
 
+@Test(arguments: ["org.example.fixture", "com.apple.dt.Xcode"])
+func duplicateApplicationRemovalMovesOnlySelectedBodyAndPreservesSharedData(_ bundleID: String) async throws {
+    let fixture = try Fixture(bundleID: bundleID)
+    let cache = try fixture.file("shared.cache", "shared cache")
+    let logs = fixture.home.appendingPathComponent("Library/Logs/" + bundleID)
+    try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+    let log = logs.appendingPathComponent("shared.log")
+    try Data("shared log".utf8).write(to: log)
+    let copy = fixture.home.appendingPathComponent("Applications/Other Version.app")
+    try FileManager.default.copyItem(at: fixture.app, to: copy)
+    let copyBefore = try ObjectSnapshot.capture(copy.path, application: true)
+    let base = fixture.context()
+    let context = EngineContext(home: base.home, appRoots: base.appRoots, catalog: {
+        try [copy, fixture.app].filter { FileManager.default.fileExists(atPath: $0.path) }
+            .map { try catalogApplication(at: $0.path, name: $0.lastPathComponent, source: "app") }
+    }, runtime: base.runtime, trash: base.trash, hook: base.hook, environment: base.environment)
+    let engine = MaintenanceEngine(context: context)
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.scanComplete)
+    let body = try #require(plan.items.first { $0.kind == .application })
+    #expect(body.path == fixture.app.path)
+    #expect(body.selection == .required)
+    #expect(body.blockedReason == nil)
+    #expect(body.impact.contains("缓存与日志保留"))
+    #expect(plan.items.count == 1)
+    #expect(plan.scanIssues.contains { $0.reason.contains("共享缓存与日志") && $0.reason.contains("保留") })
+    let result = try await apply(engine, plan, [body.itemID])
+    #expect(result.status == .completed)
+    #expect(result.items.map(\.path) == [fixture.app.path])
+    #expect(!FileManager.default.fileExists(atPath: fixture.app.path))
+    #expect(copyBefore.matches(try ObjectSnapshot.capture(copy.path, application: true)))
+    #expect(try String(contentsOf: cache, encoding: .utf8) == "shared cache")
+    #expect(try String(contentsOf: log, encoding: .utf8) == "shared log")
+}
+
+@Test func rootOwnedPackageMembersCanBeReadWithoutAuthorizingLooseSystemFiles() throws {
+    // 只读系统自带文件，验证应用包成员的 root 属主；不生成计划或移动该文件。
+    let path = "/System/Library/CoreServices/SystemVersion.plist"
+    let before = try identity(at: path)
+    #expect(before.owner == 0)
+    let snapshot = try ObjectSnapshot.capture(path, application: true)
+    #expect(snapshot.members.first?.identity == before)
+    #expect(throws: EngineFailure.self) { try ObjectSnapshot.capture(path, application: false) }
+    #expect(try identity(at: path) == before)
+}
+
+@Test(arguments: ["externalHardLink", "worldWritable", "sharedGroupWritable", "specialMode"])
+func unsafeApplicationMembersStayBlocked(_ kind: String) async throws {
+    let fixture = try Fixture(bundleID: "com.apple.dt.Xcode")
+    let member = fixture.app.appendingPathComponent("Contents/member")
+    try Data("preserve".utf8).write(to: member)
+    if kind == "externalHardLink" {
+        try FileManager.default.linkItem(at: member, to: fixture.root.appendingPathComponent("outside-link"))
+    } else {
+        #expect(chmod(member.path, kind == "worldWritable" ? 0o666 : (kind == "sharedGroupWritable" ? 0o664 : 0o4644)) == 0)
+    }
+    let engine = fixture.engine()
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.items.first?.selection == .blocked)
+    #expect(try await apply(engine, plan, plan.items.map(\.itemID)).status == .blocked)
+    #expect(try String(contentsOf: member, encoding: .utf8) == "preserve")
+}
+
+@Test func internalHardLinksMoveWithApplication() async throws {
+    let fixture = try Fixture(bundleID: "com.apple.dt.Xcode")
+    let folder = fixture.app.appendingPathComponent("Contents/Developer")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let original = folder.appendingPathComponent("original")
+    let linked = folder.appendingPathComponent("linked")
+    try Data("package content".utf8).write(to: original)
+    try FileManager.default.linkItem(at: original, to: linked)
+    let snapshot = try ObjectSnapshot.capture(fixture.app.path, application: true)
+    let plistBytes = try identity(at: fixture.app.appendingPathComponent("Contents/Info.plist").path).size
+    #expect(snapshot.bytes == UInt64(plistBytes) + UInt64(Data("package content".utf8).count))
+    let engine = fixture.engine()
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.items.first?.selection == .required)
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    #expect(result.status == .completed)
+    let returned = URL(fileURLWithPath: try #require(result.items.first?.trashPath))
+    let moved = returned.appendingPathComponent("Contents/Developer/original")
+    let other = returned.appendingPathComponent("Contents/Developer/linked")
+    #expect(try String(contentsOf: moved, encoding: .utf8) == "package content")
+    #expect(try identity(at: moved.path) == identity(at: other.path))
+    #expect(try identity(at: moved.path).links == 2)
+}
+
+@Test func externalHardLinkAddedAfterPlanPreservesApplication() async throws {
+    let fixture = try Fixture(bundleID: "com.apple.dt.Xcode")
+    let member = fixture.app.appendingPathComponent("Contents/member")
+    try Data("preserve".utf8).write(to: member)
+    let engine = fixture.engine()
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.items.first?.selection == .required)
+    let external = fixture.root.appendingPathComponent("external-link")
+    try FileManager.default.linkItem(at: member, to: external)
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    #expect(result.status == .failed)
+    #expect(try String(contentsOf: member, encoding: .utf8) == "preserve")
+    #expect(try String(contentsOf: external, encoding: .utf8) == "preserve")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+}
+
+@Test func snapshotIdentityRetainsGroupForParentAndMovedObjectChecks() throws {
+    var metadata = stat()
+    metadata.st_uid = 0; metadata.st_gid = 0; metadata.st_mode = UInt16(S_IFDIR) | 0o775
+    let original = FileIdentity(metadata)
+    let restored = try MaintenanceJSON.decoder().decode(FileIdentity.self, from: MaintenanceJSON.encoder().encode(original))
+    #expect(restored == original)
+    metadata.st_gid = 80
+    let changed = FileIdentity(metadata)
+    #expect(!restored.sameDirectory(changed))
+    #expect(!restored.sameMovedObject(changed))
+}
+
+@Test func largeApplicationSnapshotPersistsWithoutDroppingMembers() throws {
+    let fixture = try Fixture()
+    let memberIdentity = try identity(at: fixture.app.appendingPathComponent("Contents/Info.plist").path)
+    // 复现 Xcode 的成员数量和常见 SDK 路径长度；只构造元数据，不创建海量文件。
+    let members = (0..<135_501).map { index in
+        SnapshotMember(relativePath: "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Fixture.framework/Headers/\(index).h", identity: memberIdentity, linkTarget: nil)
+    }
+    let snapshot = ObjectSnapshot(parents: [], members: members)
+    let store = try EngineStore(home: fixture.home.path)
+    try store.write(snapshot, "Plans/large-fixture.json")
+    let restored = try store.read(ObjectSnapshot.self, "Plans/large-fixture.json")
+    #expect(restored.members.count == members.count)
+    #expect(snapshot.matches(restored))
+}
+
+@Test func singleXcodeRemovalKeepsDeveloperData() async throws {
+    let fixture = try Fixture(bundleID: "com.apple.dt.Xcode")
+    let cache = try fixture.file("developer.cache", "developer data")
+    let engine = fixture.engine()
+    let clean = try await scan(engine)
+    #expect(clean.items.isEmpty)
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.scanComplete)
+    #expect(plan.items.count == 1)
+    #expect(plan.items.first?.selection == .required)
+    #expect(plan.items.first?.kind == .application)
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    #expect(result.status == .completed)
+    #expect(try String(contentsOf: cache, encoding: .utf8) == "developer data")
+}
+
+@Test(arguments: ["com.apple.finder", "com.apple.dt.Instruments", "com.apple.Safari"])
+func xcodeRemovalExceptionDoesNotAllowOtherAppleApplications(_ bundleID: String) async throws {
+    let fixture = try Fixture(bundleID: bundleID)
+    let engine = fixture.engine()
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.items.first?.selection == .blocked)
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    #expect(result.status == .blocked)
+    #expect(FileManager.default.fileExists(atPath: fixture.app.path))
+}
+
+@Test(arguments: ["selected", "other", "running"])
+func duplicateApplicationRemovalStillRejectsChangesOrRunningState(_ change: String) async throws {
+    let fixture = try Fixture()
+    let copy = fixture.home.appendingPathComponent("Applications/Other.app")
+    try FileManager.default.copyItem(at: fixture.app, to: copy)
+    let running = MutableFlag()
+    let base = fixture.context(runtime: { _, _ in
+        if running.isSet { throw EngineFailure("fixture is running") }
+    })
+    let context = EngineContext(home: base.home, appRoots: base.appRoots, catalog: {
+        try [fixture.app, copy].map { try catalogApplication(at: $0.path, name: $0.lastPathComponent, source: "app") }
+    }, runtime: base.runtime, trash: base.trash, hook: base.hook, environment: base.environment)
+    let engine = MaintenanceEngine(context: context)
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.items.first?.selection == .required)
+    if change == "running" { running.set() }
+    else if change == "other" {
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.example.changed"], format: .xml, options: 0)
+        try plist.write(to: copy.appendingPathComponent("Contents/Info.plist"))
+    } else {
+        try Data("changed".utf8).write(to: fixture.app.appendingPathComponent("Contents/new-member"))
+    }
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    #expect(result.status == .blocked || result.status == .failed)
+    #expect(FileManager.default.fileExists(atPath: fixture.app.path))
+    #expect(FileManager.default.fileExists(atPath: copy.path))
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+}
+
+@Test func duplicateApplicationPlanCannotAcquireSharedResidualFromAnotherPlan() async throws {
+    let fixture = try Fixture()
+    let cache = try fixture.file("shared.cache", "keep shared")
+    let originalPlan = try await uninstall(fixture.engine(), fixture: fixture)
+    let residual = try #require(originalPlan.items.first { $0.kind == .file })
+    let copy = fixture.home.appendingPathComponent("Applications/Copy.app")
+    try FileManager.default.copyItem(at: fixture.app, to: copy)
+    let base = fixture.context()
+    let context = EngineContext(home: base.home, appRoots: base.appRoots, catalog: {
+        try [fixture.app, copy].filter { FileManager.default.fileExists(atPath: $0.path) }
+            .map { try catalogApplication(at: $0.path, name: $0.lastPathComponent, source: "app") }
+    }, runtime: base.runtime, trash: base.trash, hook: base.hook, environment: base.environment)
+    let engine = MaintenanceEngine(context: context)
+    let plan = try await uninstall(engine, fixture: fixture)
+    let body = try #require(plan.items.first)
+    #expect(body.selection == .required)
+    let store = try EngineStore(home: fixture.home.path)
+    let original = try #require(JSONSerialization.jsonObject(with: store.readData("Plans/" + originalPlan.planID + ".json")) as? [String: Any])
+    var document = try #require(JSONSerialization.jsonObject(with: store.readData("Plans/" + plan.planID + ".json")) as? [String: Any])
+    var jsonPlan = try #require(document["plan"] as? [String: Any])
+    let originalItems = try #require((original["plan"] as? [String: Any])?["items"] as? [[String: Any]])
+    var injected = try #require(originalItems.first { $0["itemID"] as? String == residual.itemID })
+    injected["dependsOnItemIDs"] = [body.itemID]
+    jsonPlan["items"] = try #require(jsonPlan["items"] as? [[String: Any]]) + [injected]
+    document["plan"] = jsonPlan
+    for key in ["snapshots", "owners"] {
+        var values = try #require(document[key] as? [String: Any])
+        values[residual.itemID] = try #require((original[key] as? [String: Any])?[residual.itemID])
+        document[key] = values
+    }
+    try store.writeData(JSONSerialization.data(withJSONObject: document), "Plans/" + plan.planID + ".json", exclusive: false)
+    let result = try await apply(engine, plan, [body.itemID, residual.itemID])
+    #expect(result.status == .blocked)
+    #expect(FileManager.default.fileExists(atPath: fixture.app.path))
+    #expect(FileManager.default.fileExists(atPath: copy.path))
+    #expect(try String(contentsOf: cache, encoding: .utf8) == "keep shared")
+}
+
 @Test func finalResultMissingIsShownAsUnknownAndNeverReplayed() async throws {
     let fixture = try Fixture()
     _ = try fixture.file("A.cache")
@@ -505,7 +731,7 @@ func systemTrashMovesOnlyNewIsolatedFixture() async throws {
 }
 
 
-@Test func caseVariantBundleIDsCannotShareCleanOrUninstallAuthorization() async throws {
+@Test func caseVariantBundleIDsCannotAuthorizeSharedData() async throws {
     let fixture = try Fixture()
     let target = try fixture.file("A.cache")
     let copy = fixture.home.appendingPathComponent("Applications/Uppercase.app")
@@ -521,7 +747,8 @@ func systemTrashMovesOnlyNewIsolatedFixture() async throws {
     let clean = try await scan(engine)
     #expect(clean.items.isEmpty)
     let removal = try await uninstall(engine, fixture: fixture)
-    #expect(removal.items.first?.selection == .blocked)
+    #expect(removal.items.first?.selection == .required)
+    #expect(removal.items.first?.path == fixture.app.path)
     #expect(removal.items.filter { $0.kind == .file }.isEmpty)
     #expect(FileManager.default.fileExists(atPath: target.path))
 }
@@ -735,11 +962,11 @@ func previouslyReturnedSystemTrashObjectMatchesOriginalSnapshot() throws {
     let engine = MaintenanceEngine(context: context)
     #expect(try await scan(engine).items.isEmpty)
     let application = try catalogApplication(at: wrapper.path, name: "Wrapped", source: "app")
-    #expect(application.unsupportedReason != nil)
+    #expect(application.unsupportedReason == nil)
     #expect(application.metadataPath == payload.appendingPathComponent("Info.plist").path)
     let box = EventBox()
     _ = try await engine.handle(command: "plan-uninstall", request: MaintenanceRequest(appPath: wrapper.path, expectedBundleID: "org.example.fixture"), emit: { box.append($0) })
-    #expect(box.events.last?.plan?.items.first?.selection == .blocked)
+    #expect(box.events.last?.plan?.items.first?.selection == .required)
     try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.example.ios"], format: .binary, options: 0).write(to: payload.appendingPathComponent("Info.plist"))
     let plan = try await scan(engine)
     #expect(plan.items.map(\.path) == [target.path])
@@ -748,7 +975,7 @@ func previouslyReturnedSystemTrashObjectMatchesOriginalSnapshot() throws {
     #expect(FileManager.default.fileExists(atPath: target.path))
 }
 
-@Test func wrappedApplicationWithUnknownListIDReportsUnsupportedInsteadOfMissing() async throws {
+@Test func wrappedApplicationWithUnknownListIDRequiresRefreshInsteadOfReportingMissing() async throws {
     let fixture = try Fixture()
     let wrapper = fixture.home.appendingPathComponent("Applications/云·示例.app")
     let payload = wrapper.appendingPathComponent("Wrapper/CloudGame.app")
@@ -761,7 +988,7 @@ func previouslyReturnedSystemTrashObjectMatchesOriginalSnapshot() throws {
     let context = EngineContext(home: base.home, appRoots: base.appRoots, catalog: {
         try [catalogApplication(at: wrapper.path, name: "云·示例", source: "App", observedBundleID: "unknown")]
     }, runtime: { _, _ in Issue.record("标识未核对成功时不应进入运行检查") }, trash: { _ in
-        Issue.record("包装应用不能移入废纸篓")
+        Issue.record("标识未核对成功时不能移入废纸篓")
         throw CancellationError()
     }, hook: base.hook, environment: base.environment)
     let engine = MaintenanceEngine(context: context)
@@ -772,8 +999,9 @@ func previouslyReturnedSystemTrashObjectMatchesOriginalSnapshot() throws {
     #expect(plan.items.isEmpty)
     let issue = try #require(plan.scanIssues.first { $0.path == wrapper.path })
     #expect(issue.reason.contains("仍然存在"))
-    #expect(issue.reason.contains("iPhone/iPad"))
-    #expect(issue.reason.contains("暂不支持"))
+    #expect(issue.reason.contains("标识"))
+    #expect(issue.reason.contains("刷新"))
+    #expect(!issue.reason.contains("暂不支持"))
     #expect(!issue.reason.contains("已缺失"))
     #expect(try await apply(engine, plan, []).status == .blocked)
     #expect(try Data(contentsOf: info) == metadata)

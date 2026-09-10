@@ -23,6 +23,8 @@ struct EngineApplication: Codable, Hashable, Sendable {
     var metadataPath: String? = nil
     var metadataDigest: String? = nil
     var unsupportedReason: String? = nil
+    var wrappedBundleRelativePath: String? = nil
+    var isWrapped: Bool { wrappedBundleRelativePath != nil }
 }
 enum ExecutionBoundary: Sendable { case beforeMove, afterStaging, beforeTrash, afterTrash }
 struct EngineContext: Sendable {
@@ -91,6 +93,7 @@ private struct ApplicationMetadata {
     let path: String
     let digest: String
     let unsupportedReason: String?
+    let wrappedBundleRelativePath: String?
 }
 
 func catalogApplication(at path: String, name: String, source: String, observedBundleID: String? = nil) throws -> EngineApplication {
@@ -99,7 +102,7 @@ func catalogApplication(at path: String, name: String, source: String, observedB
         return EngineApplication(path: path, bundleID: observedBundleID ?? "", name: name, source: source, unsupportedReason: "顶层链接应用仅用于安装归属核验，不执行维护：\(path)")
     }
     let metadata = try applicationMetadata(at: path)
-    return EngineApplication(path: path, bundleID: metadata.bundleID, name: name, source: source, metadataPath: metadata.path, metadataDigest: metadata.digest, unsupportedReason: metadata.unsupportedReason)
+    return EngineApplication(path: path, bundleID: metadata.bundleID, name: name, source: source, metadataPath: metadata.path, metadataDigest: metadata.digest, unsupportedReason: metadata.unsupportedReason, wrappedBundleRelativePath: metadata.wrappedBundleRelativePath)
 }
 
 func bundleID(at path: String) throws -> String { try applicationMetadata(at: path).bundleID }
@@ -107,18 +110,18 @@ func bundleID(at path: String) throws -> String { try applicationMetadata(at: pa
 private func applicationMetadata(at path: String) throws -> ApplicationMetadata {
     let root = try DirectoryFD(path: path)
     var infoPath = path + "/Contents/Info.plist"
-    var wrapped = false
+    var wrappedBundleRelativePath: String?
     if try existingIdentity(infoPath) == nil {
         // Apple Silicon 的已知 iOS 包装布局：只读取链接文本，再以无链接路径打开包内真实 Info。
         guard let link = try existingIdentity(path + "/WrappedBundle"), link.type == S_IFLNK else { throw EngineFailure("应用缺少普通 Info.plist，且不是已知 iOS 包装布局：\(path)") }
         var bytes = [CChar](repeating: 0, count: 4097)
-        let count = readlinkat(root.fd, "WrappedBundle", &bytes, 4096)
-        guard count > 0, count < 4096, let target = String(bytes: bytes.prefix(Int(count)).map { UInt8(bitPattern: $0) }, encoding: .utf8), target.hasPrefix("Wrapper/"), target.hasSuffix(".app") else { throw EngineFailure("iOS 包装链接无法安全识别：\(path)") }
+        let count = bytes.withUnsafeMutableBufferPointer { readlinkat(root.fd, "WrappedBundle", $0.baseAddress!, 4096) }
+        guard count > 0, count < 4096, let target = String(bytes: bytes.prefix(Int(count)).map { UInt8(bitPattern: $0) }, encoding: .utf8), target.split(separator: "/", omittingEmptySubsequences: false).count == 2, target.hasPrefix("Wrapper/"), target.hasSuffix(".app"), target.count > "Wrapper/.app".count, !target.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { throw EngineFailure("iOS 包装链接无法安全识别：\(path)") }
         let payload = try canonicalPath(path + "/" + target)
         guard pathInside(payload, path + "/Wrapper") else { throw EngineFailure("iOS 包装路径超出应用：\(path)") }
         _ = try DirectoryFD(path: payload)
         infoPath = payload + "/Info.plist"
-        wrapped = true
+        wrappedBundleRelativePath = target
     }
     let fd = open(infoPath, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK)
     guard fd >= 0 else { throw EngineFailure("应用 Info.plist 无法安全读取：\(infoPath)") }
@@ -142,17 +145,17 @@ private func applicationMetadata(at path: String) throws -> ApplicationMetadata 
     } catch { throw EngineFailure("应用 Info.plist 无法解析：\(infoPath)") }
     let id = plist["CFBundleIdentifier"] as? String ?? ""
     let unsupported: String?
-    if wrapped { unsupported = "这是 iPhone/iPad 包装应用，当前版本暂不支持移除或清理，已保留：\(path)" }
-    else if !validBundle(id) { unsupported = id.isEmpty ? "应用未提供可用的 bundle ID，已保留：\(path)" : "应用 bundle ID 不符合首批完整标识规则，已保留：\(path)" }
+    if !validBundle(id) { unsupported = id.isEmpty ? "应用未提供可用的 bundle ID，已保留：\(path)" : "应用 bundle ID 不符合首批完整标识规则，已保留：\(path)" }
     else { unsupported = nil }
-    return ApplicationMetadata(bundleID: id, path: infoPath, digest: digest(data), unsupportedReason: unsupported)
+    return ApplicationMetadata(bundleID: id, path: infoPath, digest: digest(data), unsupportedReason: unsupported, wrappedBundleRelativePath: wrappedBundleRelativePath)
 }
 func validBundle(_ value: String) -> Bool { value.range(of: #"^[A-Za-z0-9][-A-Za-z0-9]*(\.[A-Za-z0-9][-A-Za-z0-9]*)+$"#, options: .regularExpression) != nil }
 
 struct EngineRules: Sendable {
-    static let version = "mole-1.53.0-subset-1"
+    static let version = "mole-1.53.0-subset-4"
     static let engineVersion = "2.0.0"
-    static let ids = ["mole.user-cache.exact-file.v1", "mole.user-log.exact-file.v1", "mole.application.bundle.v1"]
+    static let xcodeBundleID = "com.apple.dt.xcode"
+    static let ids = ["mole.user-cache.exact-file.v1", "mole.user-log.exact-file.v1", "mole.application.bundle.v1", "tidynest.container-cache.exact-file.v1", "tidynest.container-log.exact-file.v1"]
     let arrays: [String: [String]]
     let resourceDigest: String
     init() throws {
@@ -180,7 +183,10 @@ struct EngineRules: Sendable {
         if let reason = app.unsupportedReason { return reason }
         if app.source.lowercased().contains("brew") || app.path.contains("/Caskroom/") { return "Homebrew 管理的应用需使用原管理器。" }
         if (arrays["SYSTEM_CRITICAL_BUNDLES"] ?? []).contains(where: { matches(app.bundleID, $0) }) { return "Mole 系统组件保护。" }
-        if app.bundleID.lowercased().hasPrefix("com.apple.") { return "首批范围保留所有 Apple 应用。" }
+        // 仅开放 Xcode 本体移除；Apple 组件与 Xcode 的开发数据仍受保护。
+        if app.bundleID.lowercased().hasPrefix("com.apple."), clean || app.bundleID.lowercased() != Self.xcodeBundleID {
+            return "当前范围保留此 Apple 应用或其开发数据。"
+        }
         for rule in arrays["OFFICIAL_UNINSTALLER_RULES"] ?? [] {
             let parts = rule.components(separatedBy: "|")
             guard parts.count == 3 else { return "厂商卸载规则无法解析。" }
