@@ -5,22 +5,21 @@ import XCTest
 
 @MainActor
 final class WorkspaceModelTests: XCTestCase {
-    func testStartupUsesCleanPageWithoutAutomaticQueries() async {
+    func testStartupUsesApplicationsPageWithoutAutomaticQueries() async {
         let model = WorkspaceModel(detect: { installation() }, applications: { _ in XCTFail("启动、重新进入和重新检测都不能自动读取应用"); return [] }, analyze: { _, _ in XCTFail("首次启动不应扫描目录"); throw CancellationError() })
         model.start()
         await settle(model)
-        XCTAssertEqual(model.page, .clean)
+        XCTAssertEqual(model.page, .applications)
         XCTAssertEqual(model.maintenance.phase, .idle)
         XCTAssertEqual(model.installation, installation())
         XCTAssertEqual(model.applicationsPhase, .idle)
         XCTAssertTrue(model.applications.isEmpty)
         XCTAssertFalse(model.hasApplicationSnapshot)
         XCTAssertTrue(model.canQuery)
-        model.page = .disk
-        model.page = .applications
+        model.page = .clean
         model.start()
         XCTAssertFalse(model.isBusy, "重复显示窗口不应重新扫描")
-        XCTAssertEqual(model.page, .applications, "同一会话不应强制跳回默认页")
+        XCTAssertEqual(model.page, .clean, "同一会话不应强制跳回默认页")
         model.detectInstallation()
         await settle(model)
         XCTAssertEqual(model.applicationsPhase, .idle)
@@ -183,8 +182,7 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertTrue(model.canInstallMole)
         XCTAssertEqual(model.applications, previous.applications)
         model.page = .applications
-        model.openUninstallPlan(previous.applications[0])
-        XCTAssertEqual(model.page, .applications, "旧列表不能发起移除检查")
+        XCTAssertTrue(model.canPlanUninstall(previous.applications[0]), "缓存不阻止独立维护检查，依赖错误由检查流程报告")
     }
 
     func testManualRefreshPersistsResultAndKeepsExistingSelection() async throws {
@@ -209,12 +207,11 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(cache.load(), previous)
         model.selectedApplicationID = old.id
         model.searchText = "Updated"
-        model.openUninstallPlan(old)
-        XCTAssertEqual(model.page, .applications, "缓存不能直接发起移除检查")
+        XCTAssertTrue(model.canPlanUninstall(old), "缓存可直接发起独立检查")
         model.loadApplications()
         await gate.waitForRequests(1)
         XCTAssertEqual(model.applications, [old])
-        model.openUninstallPlan(old)
+        XCTAssertTrue(model.canPlanUninstall(old), "刷新期间仍可发起独立检查，实际派发由并发隔离用例验证")
         XCTAssertEqual(model.page, .applications)
         let updated = application("Updated", path: old.path)
         await gate.finish(0, with: [updated])
@@ -229,7 +226,7 @@ final class WorkspaceModelTests: XCTestCase {
         let reopened = WorkspaceModel(detect: { throw MoleError.notInstalled }, applications: { _ in XCTFail("恢复快照不能自动查询"); return [] }, applicationCache: cache)
         reopened.start()
         XCTAssertEqual(reopened.applications, [updated], "新会话应直接恢复最新快照")
-        XCTAssertEqual(reopened.page, .clean, "上次停留在应用页也不改变新会话的默认页")
+        XCTAssertEqual(reopened.page, .applications, "恢复快照后新会话固定打开应用页")
         await settle(reopened)
     }
 
@@ -252,7 +249,7 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(cache.load(), previous)
     }
 
-    func testFailedManualRefreshKeepsSnapshotAndBlocksPlan() async throws {
+    func testFailedManualRefreshKeepsSnapshotAndAllowsIndependentPlan() async throws {
         let cache = ApplicationListCache(fileURL: try cacheFixtureURL())
         let previous = ApplicationListSnapshot(applications: [application("Old", path: "/tmp/old.app")], updatedAt: Date(timeIntervalSince1970: 100))
         try cache.save(previous)
@@ -265,8 +262,7 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(model.applications, previous.applications)
         XCTAssertEqual(cache.load(), previous)
         model.page = .applications
-        model.openUninstallPlan(previous.applications[0])
-        XCTAssertEqual(model.page, .applications)
+        XCTAssertTrue(model.canPlanUninstall(previous.applications[0]), "刷新失败不阻止引擎独立复核")
     }
 
     func testEmptyManualResultReplacesPreviousSnapshotAndRestoresWithoutQuery() async throws {

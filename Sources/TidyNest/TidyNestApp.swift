@@ -5,7 +5,10 @@ import TidyNestCore
 @main
 struct TidyNestApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var model = WorkspaceModel(applicationCache: .standard)
+    @State private var model = WorkspaceModel(
+        maintenance: MaintenanceModel(operationHistory: OperationHistoryModel(store: .standard)),
+        applicationCache: .standard
+    )
 
     var body: some Scene {
         WindowGroup("拾净 · TidyNest") {

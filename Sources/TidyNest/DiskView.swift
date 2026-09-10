@@ -14,19 +14,19 @@ struct DiskView: View {
                 }
                 Spacer(minLength: 24)
                 Button(action: model.chooseDirectory) { Label("选择文件夹", systemImage: "folder.badge.plus") }
-                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.canQuery)
+                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.canAnalyzeDisk)
             }.padding(28)
 
             if let directory = model.requestedDirectory {
                 HStack(spacing: 12) {
                     Button(action: model.goUp) { Image(systemName: "arrow.up") }
-                        .help("返回上层文件夹").disabled(!model.canQuery || directory.path == "/")
+                        .help("返回上层文件夹").disabled(!model.canAnalyzeDisk || directory.path == "/")
                         .accessibilityLabel("返回上层文件夹")
                     Image(systemName: "folder.fill").foregroundStyle(NestStyle.green)
                     Text(directory.path).font(.callout).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                     Spacer(minLength: 8)
                     Button { model.analyze(directory: directory) } label: { Image(systemName: "arrow.clockwise") }
-                        .help("重新读取").accessibilityLabel("重新读取目录").disabled(!model.canQuery)
+                        .help("重新读取").accessibilityLabel("重新读取目录").disabled(!model.canAnalyzeDisk)
                     Button { model.reveal(path: directory.path) } label: { Image(systemName: "arrow.up.forward.square") }
                         .help("在 Finder 中显示").accessibilityLabel("在 Finder 中显示当前文件夹")
                 }
@@ -79,13 +79,13 @@ struct DiskView: View {
                                 Text(formattedBytes(entry.size)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
                                 if entry.isDirectory {
                                     Button { model.analyze(directory: URL(fileURLWithPath: entry.path)) } label: { Image(systemName: "chevron.right") }
-                                        .buttonStyle(.borderless).help("打开 \(entry.name)").accessibilityLabel("打开文件夹 \(entry.name)").disabled(!model.canQuery)
+                                        .buttonStyle(.borderless).help("打开 \(entry.name)").accessibilityLabel("打开文件夹 \(entry.name)").disabled(!model.canAnalyzeDisk)
                                 }
                             }
                             .padding(.vertical, 10).tag(entry.id)
                             .contextMenu {
                                 if entry.isDirectory {
-                                    Button("查看文件夹") { model.analyze(directory: URL(fileURLWithPath: entry.path)) }.disabled(!model.canQuery)
+                                    Button("查看文件夹") { model.analyze(directory: URL(fileURLWithPath: entry.path)) }.disabled(!model.canAnalyzeDisk)
                                 }
                                 Button("在 Finder 中显示") { model.reveal(path: entry.path) }
                             }
@@ -114,7 +114,7 @@ struct DiskView: View {
                     DetailField(label: "类型", value: entry.isDirectory ? "文件夹" : "文件")
                     DetailField(label: "位置", value: entry.path)
                     if entry.isDirectory {
-                        Button { model.analyze(directory: URL(fileURLWithPath: entry.path)) } label: { Label("查看文件夹", systemImage: "folder") }.disabled(!model.canQuery)
+                        Button { model.analyze(directory: URL(fileURLWithPath: entry.path)) } label: { Label("查看文件夹", systemImage: "folder") }.disabled(!model.canAnalyzeDisk)
                     }
                     Button { model.reveal(path: entry.path) } label: { Label("在 Finder 中显示", systemImage: "arrow.up.forward.square") }
                 }.controlSize(.large).padding(28).frame(maxWidth: .infinity, alignment: .leading)

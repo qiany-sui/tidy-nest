@@ -6,7 +6,7 @@ import TidyNestProtocol
 
 @MainActor
 final class SingleApplicationRefreshTests: XCTestCase {
-    func testSingleRefreshPersistsOnlyTargetWithoutTrustingOtherCachedRowsOrReopenedCache() async throws {
+    func testSingleRefreshPersistsOnlyTargetAndCachedRowsRemainAvailableForPlan() async throws {
         let first = singleApplication("First", path: "/fixture/first.app")
         let second = singleApplication("Second", path: "/fixture/second.app")
         let updated = singleApplication("First Updated", path: first.path)
@@ -16,8 +16,7 @@ final class SingleApplicationRefreshTests: XCTestCase {
         model.start()
         await settle(model)
         XCTAssertFalse(model.canQuery, "原生单项查询不依赖 Mole 连接")
-        XCTAssertFalse(model.isApplicationRefreshed(first))
-        XCTAssertFalse(model.canPlanUninstall(first))
+        XCTAssertTrue(model.canPlanUninstall(first))
         model.page = .applications
         model.selectedApplicationID = first.id
         model.searchText = "First"
@@ -35,16 +34,13 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertEqual(model.applicationRefreshPhase, .loaded)
         XCTAssertEqual(model.applicationsPhase, .idle, "单项成功不能冒充全量查询成功")
         XCTAssertEqual(model.applicationsUpdatedAt, singleSnapshotDate)
-        XCTAssertTrue(model.isApplicationRefreshed(updated))
         XCTAssertTrue(model.canPlanUninstall(updated))
-        XCTAssertFalse(model.isApplicationRefreshed(first), "相同路径的旧记录不能沿用核验状态")
-        XCTAssertFalse(model.canPlanUninstall(first))
-        XCTAssertFalse(model.canPlanUninstall(second))
+        XCTAssertFalse(model.canPlanUninstall(first), "已被新记录替换的旧参数不能启动检查")
+        XCTAssertTrue(model.canPlanUninstall(second))
         model.openUninstallPlan(first)
-        model.openUninstallPlan(second)
         XCTAssertEqual(model.page, .applications)
         model.maintenance.canStartRequest = { false }
-        XCTAssertFalse(model.canPlanUninstall(updated), "单项可信也必须服从维护互斥")
+        XCTAssertFalse(model.canPlanUninstall(updated), "直接检查也必须服从维护互斥")
         model.openUninstallPlan(updated)
         XCTAssertEqual(model.page, .applications)
         XCTAssertEqual(cache.load(), ApplicationListSnapshot(applications: [updated, second], updatedAt: singleSnapshotDate))
@@ -54,9 +50,51 @@ final class SingleApplicationRefreshTests: XCTestCase {
         await settle(reopened)
         XCTAssertEqual(reopened.applications, [updated, second])
         XCTAssertEqual(reopened.applicationsUpdatedAt, singleSnapshotDate)
-        XCTAssertFalse(reopened.isApplicationRefreshed(updated))
-        XCTAssertFalse(reopened.canPlanUninstall(updated))
-        XCTAssertFalse(reopened.canPlanUninstall(second))
+        XCTAssertTrue(reopened.canPlanUninstall(updated))
+        XCTAssertTrue(reopened.canPlanUninstall(second))
+    }
+
+    func testCachedApplicationOpensPlanWithoutRefreshingListOrTarget() async throws {
+        let first = singleApplication("First", path: "/fixture/first.app")
+        let second = singleApplication("Second", path: "/fixture/second.app")
+        let cache = try singleRefreshCache([first, second])
+        let snapshot = cache.load()
+        let recorder = SingleRefreshPlanRecorder()
+        let plan = MaintenancePlan(schemaVersion: 1, planID: "fixture-cached-plan", runID: "fixture-scan", kind: .uninstall, title: "隔离检查", engineVersion: "fixture", engineDigest: "fixture", rulesVersion: "fixture", configurationDigest: "fixture", createdAt: singleSnapshotDate, scopeRoots: [first.path], scanComplete: true, scanIssues: [], items: [])
+        let maintenance = MaintenanceModel(actions: MaintenanceActions(
+            capabilities: { EngineCapabilities(schemaVersion: 1, engineVersion: "fixture", engineDigest: "fixture", rulesVersion: "fixture", supportedRuleIDs: ["fixture"], supportedActions: [.trashItem]) },
+            scanClean: { _ in XCTFail("不能转为全局清理扫描"); throw SingleRefreshError.failed },
+            planUninstall: { application, _ in await recorder.record(application); return plan },
+            apply: { _, _, _ in XCTFail("只检查，不能执行移除"); throw SingleRefreshError.failed },
+            history: { [] }, protections: { [] }, protect: { _ in }, unprotect: { _ in }, forceEnd: {}
+        ))
+        let model = singleRefreshWorkspace(cache: cache, maintenance: maintenance, refresh: { _ in
+            XCTFail("检查不能额外触发单项刷新"); throw SingleRefreshError.failed
+        })
+        model.start()
+        XCTAssertFalse(model.canPlanUninstall(first), "检测进行中仍然互斥")
+        await settle(model)
+        XCTAssertTrue(model.canPlanUninstall(first), "从缓存恢复后无需先刷新")
+        model.searchText = "First"
+        model.selectedApplicationID = first.id
+        model.openUninstallPlan(first)
+        XCTAssertEqual(model.page, .clean)
+        XCTAssertFalse(model.canPlanUninstall(second), "不能在检查进行中重复启动")
+        model.openUninstallPlan(second)
+        await maintenance.waitForCurrentOperation()
+        let requests = await recorder.applications
+        XCTAssertEqual(requests, [first])
+        XCTAssertEqual(maintenance.phase, .ready)
+        XCTAssertEqual(model.applications, [first, second])
+        XCTAssertEqual(model.applicationsPhase, .idle)
+        XCTAssertEqual(model.applicationRefreshPhase, .idle)
+        XCTAssertEqual(model.searchText, "First")
+        XCTAssertEqual(model.selectedApplicationID, first.id)
+        XCTAssertEqual(cache.load(), snapshot)
+        XCTAssertNil(maintenance.confirmation)
+        XCTAssertNil(maintenance.result)
+        await model.prepareToTerminate()
+        XCTAssertFalse(model.canPlanUninstall(first), "退出收尾中不得启动检查")
     }
 
     func testSingleRefreshPassesLatestRecordToUninstallPlan() async throws {
@@ -79,10 +117,9 @@ final class SingleApplicationRefreshTests: XCTestCase {
         await settle(model)
         model.page = .applications
         model.openUninstallPlan(first)
-        model.openUninstallPlan(second)
         await settle(model)
         let rejectedRequests = await recorder.applications
-        XCTAssertTrue(rejectedRequests.isEmpty, "旧记录和其他缓存项都不能进入检查")
+        XCTAssertTrue(rejectedRequests.isEmpty, "已被刷新结果替换的旧记录不能进入检查")
         XCTAssertEqual(model.page, .applications)
         model.openUninstallPlan(updated)
         XCTAssertEqual(model.page, .clean)
@@ -116,11 +153,9 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertEqual(model.applications, [updated, second])
         XCTAssertEqual(model.selectedApplication, second)
         XCTAssertEqual(model.searchText, "Second")
-        XCTAssertTrue(model.isApplicationRefreshed(updated))
-        XCTAssertFalse(model.isApplicationRefreshed(second))
     }
 
-    func testFailedSingleRefreshRevokesOnlyTargetTrustAndKeepsFullListState() async throws {
+    func testFailedSingleRefreshKeepsListAndAllowsIndependentPlan() async throws {
         let first = singleApplication("First", path: "/fixture/first.app")
         let second = singleApplication("Second", path: "/fixture/second.app")
         let cache = try singleRefreshCache([first, second])
@@ -139,10 +174,8 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertEqual(model.applicationsPhase, .loaded)
         XCTAssertEqual(model.applicationsUpdatedAt, snapshot?.updatedAt)
         XCTAssertEqual(cache.load(), snapshot)
-        XCTAssertFalse(model.isApplicationRefreshed(first))
-        XCTAssertFalse(model.canPlanUninstall(first))
-        XCTAssertTrue(model.isApplicationRefreshed(second))
-        XCTAssertTrue(model.canPlanUninstall(second), "失败不应撤销其他记录的核验状态")
+        XCTAssertTrue(model.canPlanUninstall(first))
+        XCTAssertTrue(model.canPlanUninstall(second), "单项刷新失败不影响其他记录的独立检查")
     }
 
     func testCancelledSingleRefreshWaitsForCleanupAndDiscardsLateResult() async throws {
@@ -171,8 +204,7 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertEqual(model.applicationRefreshPhase, .cancelled)
         XCTAssertEqual(model.applications, [first, second])
         XCTAssertEqual(cache.load(), snapshot)
-        XCTAssertFalse(model.isApplicationRefreshed(first))
-        XCTAssertFalse(model.canPlanUninstall(first))
+        XCTAssertTrue(model.canPlanUninstall(first))
         XCTAssertTrue(model.canPlanUninstall(second))
         model.refreshApplication(second)
         await gate.waitForRequests(2)
@@ -194,13 +226,11 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertEqual(model.applications, [first, second])
         XCTAssertEqual(cache.load()?.applications, [first, second])
         XCTAssertEqual(model.applicationsUpdatedAt, singleSnapshotDate)
-        XCTAssertFalse(model.isApplicationRefreshed(first))
-        XCTAssertFalse(model.isApplicationRefreshed(second))
-        XCTAssertFalse(model.canPlanUninstall(first))
-        XCTAssertFalse(model.canPlanUninstall(second))
+        XCTAssertTrue(model.canPlanUninstall(first))
+        XCTAssertTrue(model.canPlanUninstall(second))
     }
 
-    func testFullRefreshReplacesSingleTrustAndFailureCannotRestorePreviousTrust() async throws {
+    func testFullRefreshReplacesRowsAndFailureKeepsIndependentPlanAvailable() async throws {
         let first = singleApplication("First", path: "/fixture/first.app")
         let second = singleApplication("Second", path: "/fixture/second.app")
         let updated = singleApplication("First Updated", path: first.path)
@@ -211,33 +241,28 @@ final class SingleApplicationRefreshTests: XCTestCase {
         await settle(model)
         model.refreshApplication(first)
         await settle(model)
-        XCTAssertTrue(model.isApplicationRefreshed(updated))
-        XCTAssertFalse(model.isApplicationRefreshed(second))
         model.loadApplications()
         await gate.waitForRequests(1)
-        XCTAssertFalse(model.isApplicationRefreshed(updated), "全量刷新开始即撤销单项核验状态")
+        XCTAssertTrue(model.canPlanUninstall(updated), "应用列表刷新与独立检查可并行")
         await gate.finish(0, with: .success([first, second]))
         await settle(model)
-        XCTAssertFalse(model.isApplicationRefreshed(updated))
-        XCTAssertTrue(model.isApplicationRefreshed(first))
-        XCTAssertTrue(model.isApplicationRefreshed(second))
         XCTAssertTrue(model.canPlanUninstall(first))
         XCTAssertTrue(model.canPlanUninstall(second))
         let snapshot = cache.load()
         model.loadApplications()
         await gate.waitForRequests(2)
-        XCTAssertFalse(model.isApplicationRefreshed(first))
-        XCTAssertFalse(model.isApplicationRefreshed(second))
+        XCTAssertTrue(model.canPlanUninstall(first))
+        XCTAssertTrue(model.canPlanUninstall(second))
         await gate.finish(1, with: .failure(.failed))
         await settle(model)
         guard case .failed = model.applicationsPhase else { return XCTFail("全量失败应保留错误状态") }
         XCTAssertEqual(model.applications, [first, second])
         XCTAssertEqual(cache.load(), snapshot)
-        XCTAssertFalse(model.canPlanUninstall(first))
-        XCTAssertFalse(model.canPlanUninstall(second))
+        XCTAssertTrue(model.canPlanUninstall(first))
+        XCTAssertTrue(model.canPlanUninstall(second))
     }
 
-    func testCancelledFullRefreshCannotRestoreSingleTrustOrSaveLateList() async throws {
+    func testCancelledFullRefreshPreservesRowsWithoutSavingLateList() async throws {
         let first = singleApplication("First", path: "/fixture/first.app")
         let second = singleApplication("Second", path: "/fixture/second.app")
         let updated = singleApplication("First Updated", path: first.path)
@@ -252,7 +277,6 @@ final class SingleApplicationRefreshTests: XCTestCase {
         let snapshot = cache.load()
         model.loadApplications()
         await gate.waitForRequests(1)
-        XCTAssertFalse(model.isApplicationRefreshed(updated))
         model.cancelOperation()
         XCTAssertTrue(model.isBusy)
         await gate.finish(0, with: .success([first, second]))
@@ -260,9 +284,8 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertEqual(model.applicationsPhase, .cancelled)
         XCTAssertEqual(model.applications, [updated, second])
         XCTAssertEqual(cache.load(), snapshot)
-        XCTAssertFalse(model.isApplicationRefreshed(updated))
-        XCTAssertFalse(model.canPlanUninstall(updated))
-        XCTAssertFalse(model.canPlanUninstall(second))
+        XCTAssertTrue(model.canPlanUninstall(updated))
+        XCTAssertTrue(model.canPlanUninstall(second))
     }
 
     func testSingleRefreshAndDetectionOrOtherQueriesRemainMutuallyExclusive() async throws {
@@ -285,7 +308,7 @@ final class SingleApplicationRefreshTests: XCTestCase {
         model.detectInstallation()
         model.loadApplications()
         model.analyze(directory: URL(fileURLWithPath: "/fixture"))
-        model.maintenance.scanClean()
+        XCTAssertTrue(model.maintenance.canScan, "检查可以独立进行，查询之间仍不重入")
         let detectionCount = await detection.count
         XCTAssertEqual(detectionCount, 1)
         XCTAssertEqual(model.maintenance.phase, .idle)

@@ -15,14 +15,15 @@ struct MaintenanceActions: Sendable {
     let forceEnd: @Sendable () -> Void
 
     static func live() -> Self {
-        // 同一客户端串行持有本次 Bridge，取消与强制结束才能定位到正确请求。
+        // 检查和执行共用一个客户端；记录读取独立，取消时不会结束另一边的 Bridge。
         let service = MaintenanceService()
+        let historyService = MaintenanceService()
         return Self(
             capabilities: { try await service.capabilities() },
             scanClean: { try await service.scanClean(onEvent: $0) },
             planUninstall: { try await service.planUninstall(application: $0, onEvent: $1) },
             apply: { try await service.apply(planID: $0, selectedItemIDs: $1, onEvent: $2) },
-            history: { try await service.history() },
+            history: { try await historyService.history() },
             protections: { try await service.protections() },
             protect: { _ = try await service.protect(path: $0) },
             unprotect: { _ = try await service.unprotect(path: $0) },
@@ -65,23 +66,34 @@ final class MaintenanceModel {
     var searchText = ""
     var focusedItemID: String?
     @ObservationIgnored var canStartRequest: @MainActor () -> Bool = { true }
+    @ObservationIgnored var canScanConcurrently: @MainActor () -> Bool = { false }
     @ObservationIgnored var beforeRequest: @MainActor () async -> Void = {}
     @ObservationIgnored private let actions: MaintenanceActions
     @ObservationIgnored private var operation: Task<Void, Never>?
     private var operationID: UUID?
+    @ObservationIgnored private var historyOperation: Task<Void, Never>?
+    private var historyOperationID: UUID?
+    let operationHistory: OperationHistoryModel
+    private var executionRunID: String?
     private var applying = false
     private var stopping = false
 
-    init(actions: MaintenanceActions = .live()) { self.actions = actions }
+    init(actions: MaintenanceActions = .live(), operationHistory: OperationHistoryModel = OperationHistoryModel()) {
+        self.actions = actions
+        self.operationHistory = operationHistory
+    }
 
     var isBusy: Bool { operationID != nil }
+    var isReadingHistory: Bool { historyOperationID != nil }
+    var canReloadHistory: Bool { !isReadingHistory && !isExecuting && !stopping }
     var isExecuting: Bool { isBusy && applying }
     var processedItemCount: Int { Set(itemResults.map(\.itemID)).intersection(selectedItemIDs).count }
     var executionProgress: Double? {
         guard isExecuting, !selectedItemIDs.isEmpty else { return nil }
         return Double(processedItemCount) / Double(selectedItemIDs.count)
     }
-    var canStart: Bool { !isBusy && !stopping && canStartRequest() }
+    var canStart: Bool { !isBusy && !isReadingHistory && !stopping && canStartRequest() }
+    var canScan: Bool { !isBusy && !stopping && (canStartRequest() || canScanConcurrently()) }
     var selectedItems: [MaintenanceItem] { plan?.items.filter { selectedItemIDs.contains($0.itemID) } ?? [] }
     var selectedBytes: UInt64 { selectedItems.compactMap(\.estimatedBytes).reduce(0, +) }
     var unknownSizeCount: Int { selectedItems.filter { $0.estimatedBytes == nil }.count }
@@ -123,14 +135,18 @@ final class MaintenanceModel {
 
     func scanClean() { startPlan(application: nil) }
     func planUninstall(_ application: MoleApplication) { startPlan(application: application) }
-
     func recheckApplication() {
         guard let application = plannedApplication else { return }
         startPlan(application: application)
     }
 
     private func startPlan(application: MoleApplication?) {
-        guard let id = begin() else { return }
+        guard let id = begin(scanning: true) else { return }
+        let activity = OperationActivity(
+            kind: application == nil ? .cleanScan : .uninstallPlan,
+            title: application.map { "检查移除计划：\($0.name)" } ?? "检查缓存与日志",
+            targetPath: application?.path
+        )
         plannedApplication = application
         plan = nil
         confirmation = nil
@@ -144,7 +160,7 @@ final class MaintenanceModel {
         phase = .scanning
         progressMessage = application == nil ? "正在检查缓存与日志…" : "正在检查应用与相关文件…"
         operation = Task {
-            await beforeRequest()
+            // 检查不修改目标文件，已获准并行后不再等待磁盘任务或其取消收尾。
             do {
                 try Task.checkCancellation()
                 let capabilities = try await actions.capabilities()
@@ -160,9 +176,15 @@ final class MaintenanceModel {
                 selectedItemIDs = Set(value.items.filter { $0.selection == .required }.map(\.itemID))
                 phase = .ready
                 progressMessage = ""
+                let available = value.items.filter { $0.selection != .blocked }.count
+                operationHistory.record(activity.finished(value.scanComplete ? .completed : .partial,
+                    summary: "发现 \(value.items.count) 个项目，其中 \(available) 个可选，\(value.scanIssues.count) 项检查提示。仅生成检查计划，未执行移除。"))
             } catch {
                 guard operationID == id else { return }
-                phase = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
+                let cancelled = error is CancellationError || Task.isCancelled
+                phase = cancelled ? .cancelled : .failed(error.localizedDescription)
+                operationHistory.record(activity.finished(cancelled ? .cancelled : .failed,
+                    summary: cancelled ? "检查已取消，未执行移除。" : error.localizedDescription))
             }
             finish(id)
         }
@@ -179,7 +201,10 @@ final class MaintenanceModel {
         guard canConfirm, let confirmation, let plan,
               confirmation.planID == plan.planID, Set(confirmation.itemIDs) == selectedItemIDs,
               let id = begin() else { return }
+        let activity = OperationActivity(kind: .execution, title: confirmation.title, targetPath: plannedApplication?.path)
         self.confirmation = nil
+        executionRunID = nil
+        historyPhase = .idle
         applying = true
         planExpired = true
         result = nil
@@ -189,18 +214,30 @@ final class MaintenanceModel {
         progressMessage = "正在重新核对选中项目…"
         operation = Task {
             await beforeRequest()
+            var dispatched = false
             do {
+                try Task.checkCancellation()
+                dispatched = true
                 let value = try await actions.apply(confirmation.planID, confirmation.itemIDs, eventHandler(id))
                 guard operationID == id else { return }
                 // apply 的正常取消仍返回最终记录，不能用 Task.isCancelled 丢弃已经发生的结果。
                 result = value
+                operationHistory.record(OperationRecord(execution: value))
                 itemResults = value.items
                 executionUncertain = value.status == .unknown
                 phase = .finished
             } catch {
                 guard operationID == id else { return }
-                executionUncertain = true
-                phase = .failed("未收到完整执行结果，请在操作记录中核对。\(error.localizedDescription)")
+                if !dispatched && error is CancellationError {
+                    executionUncertain = false
+                    phase = .cancelled
+                    operationHistory.record(activity.finished(.cancelled, summary: "执行开始前已取消，未移除任何项目。"))
+                } else {
+                    executionUncertain = true
+                    let message = "未收到完整执行结果，请在操作记录中核对。\(error.localizedDescription)"
+                    phase = .failed(message)
+                    operationHistory.record(activity.finished(.unknown, summary: message, executionRunID: executionRunID))
+                }
             }
             finish(id)
         }
@@ -222,20 +259,32 @@ final class MaintenanceModel {
     }
 
     func reloadHistory() {
-        guard let id = begin() else { return }
-        history = []
+        guard canReloadHistory else { return }
+        operationHistory.load()
+        let id = UUID()
+        historyOperationID = id
         historyPhase = .loading
-        operation = Task {
-            await beforeRequest()
+        historyOperation = Task {
             do {
                 try Task.checkCancellation()
                 let values = try await actions.history()
                 try Task.checkCancellation()
                 history = values.sorted { $0.finishedAt > $1.finishedAt }
+                operationHistory.mergeExecutions(values)
                 historyPhase = .loaded
-            } catch { historyPhase = error is CancellationError ? .cancelled : .failed(error.localizedDescription) }
-            finish(id)
+            } catch {
+                historyPhase = error is CancellationError || Task.isCancelled ? .cancelled : .failed(error.localizedDescription)
+            }
+            guard historyOperationID == id else { return }
+            historyOperationID = nil
+            historyOperation = nil
         }
+    }
+
+    func cancelHistory() {
+        guard isReadingHistory else { return }
+        historyPhase = .cancelling
+        historyOperation?.cancel()
     }
 
     func reloadProtections() {
@@ -275,18 +324,26 @@ final class MaintenanceModel {
         }
     }
 
-    func waitForCurrentOperation() async { await operation?.value }
+    func waitForCurrentOperation() async {
+        await operation?.value
+        await historyOperation?.value
+    }
+
+    func stopRequests(cancelMaintenance: Bool) {
+        stopping = true
+        if cancelMaintenance { cancel() }
+        cancelHistory()
+    }
 
     func prepareToTerminate(cancel: Bool) async {
-        stopping = true
-        if cancel { self.cancel() }
-        await operation?.value
+        stopRequests(cancelMaintenance: cancel)
+        await waitForCurrentOperation()
     }
 
     func resumeAfterWindowClose() { stopping = false }
 
-    private func begin() -> UUID? {
-        guard canStart else { return nil }
+    private func begin(scanning: Bool = false) -> UUID? {
+        guard (scanning ? canScan : canStart) else { return nil }
         let id = UUID()
         operationID = id
         notice = nil
@@ -304,6 +361,7 @@ final class MaintenanceModel {
         { [weak self] event in
             Task { @MainActor in
                 guard let self, self.operationID == id else { return }
+                if self.applying { self.executionRunID = event.runID }
                 if let message = event.message, self.phase != .cancelling { self.progressMessage = message }
                 if let item = event.itemResult {
                     self.itemResults.removeAll { $0.itemID == item.itemID }

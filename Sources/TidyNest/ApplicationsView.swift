@@ -139,7 +139,7 @@ struct ApplicationsView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Button { model.refreshApplication(application) } label: {
                             Label("刷新此应用", systemImage: "arrow.clockwise")
-                        }.controlSize(.large).disabled(model.isBusy || model.isTerminating)
+                        }.controlSize(.large).disabled(!model.canRefreshApplication(application))
                         Button { model.reveal(path: application.path) } label: { Label("在 Finder 中显示", systemImage: "folder") }
                             .controlSize(.large)
                     }
@@ -147,7 +147,7 @@ struct ApplicationsView: View {
                     Button { model.openUninstallPlan(application) } label: {
                         Label("检查移除计划", systemImage: "checklist")
                     }.controlSize(.large).disabled(!model.canPlanUninstall(application))
-                    Text(model.isApplicationRefreshed(application) ? "先检查应用本体与可移除的缓存、日志，再由你确认移入废纸篓。" : "先刷新此应用，即可检查移除计划，无需刷新完整列表。")
+                    Text("可直接检查移除计划，无需先刷新。检查时会重新核验应用与相关文件，再由你确认移入废纸篓。")
                         .font(.caption).foregroundStyle(.secondary)
                 }.padding(28).frame(maxWidth: .infinity, alignment: .leading)
             }.background(NestStyle.subtle.opacity(0.5))

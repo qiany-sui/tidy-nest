@@ -19,10 +19,10 @@ struct MaintenanceView: View {
                 Spacer(minLength: 20)
                 if maintenance.plannedApplication != nil {
                     Button { maintenance.recheckApplication() } label: { Label("重新检查此应用", systemImage: "arrow.clockwise") }
-                        .controlSize(.large).disabled(!maintenance.canStart)
+                        .controlSize(.large).disabled(!maintenance.canScan)
                 }
                 Button { maintenance.scanClean() } label: { Label("扫描缓存与日志", systemImage: "magnifyingglass") }
-                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(!maintenance.canStart)
+                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(!maintenance.canScan)
             }.padding(28)
             Divider()
             if let notice = maintenance.notice {

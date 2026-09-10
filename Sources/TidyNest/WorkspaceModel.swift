@@ -9,7 +9,7 @@ enum QueryPhase: Equatable {
 }
 
 enum WorkspacePage: String, CaseIterable, Identifiable {
-    case clean, applications, disk, history
+    case applications, clean, disk, history
     var id: Self { self }
     var title: String {
         switch self { case .clean: "清理"; case .applications: "应用"; case .disk: "磁盘"; case .history: "操作记录" }
@@ -21,7 +21,7 @@ enum WorkspacePage: String, CaseIterable, Identifiable {
 
 @MainActor @Observable
 final class WorkspaceModel {
-    var page: WorkspacePage = .clean
+    var page: WorkspacePage = .applications
     var searchText = ""
     var selectedApplicationID: String?
     var selectedDiskEntryID: String?
@@ -32,7 +32,6 @@ final class WorkspaceModel {
     private(set) var applicationsPhase: QueryPhase = .idle
     private(set) var applicationRefreshPhase: QueryPhase = .idle
     private(set) var applicationRefreshTarget: MoleApplication?
-    private var refreshedApplications: Set<MoleApplication> = []
     private(set) var diskPhase: QueryPhase = .idle
     private(set) var applications: [MoleApplication] = []
     private(set) var applicationsUpdatedAt: Date?
@@ -44,6 +43,7 @@ final class WorkspaceModel {
 
     @ObservationIgnored private var operation: Task<Void, Never>?
     @ObservationIgnored private var cleanupTask: Task<Void, Never>?
+    private var queryActivity: OperationActivity?
     private var operationID: UUID?
     private var cleanupID: UUID?
     @ObservationIgnored private var didStart = false
@@ -75,16 +75,27 @@ final class WorkspaceModel {
             guard let self else { return false }
             return self.operationID == nil && self.cleanupID == nil && !self.isTerminating
         }
+        self.maintenance.canScanConcurrently = { [weak self] in
+            guard let self else { return false }
+            let reading = [self.diskPhase, self.applicationsPhase, self.applicationRefreshPhase].contains(.loading)
+            return self.operationID != nil && reading && self.cleanupID == nil && !self.isTerminating
+        }
         self.maintenance.beforeRequest = { [weak self] in
-            // M1 取消后可能仍在回收子进程；维护任务必须等它收尾，避免后台请求重叠。
+            // 执行和保护设置仍须等待查询收尾；只读检查可与应用、磁盘查询并行。
             await self?.cleanupTask?.value
             self?.cleanupTask = nil
         }
     }
 
-    var isBusy: Bool { operationID != nil || cleanupID != nil || maintenance.isBusy }
+    var operationHistory: OperationHistoryModel { maintenance.operationHistory }
+    var isBusy: Bool { operationID != nil || cleanupID != nil || maintenance.isBusy || maintenance.isReadingHistory }
     var hasApplicationSnapshot: Bool { applicationsUpdatedAt != nil }
-    var canQuery: Bool { installation?.isSupported == true && !isBusy && !isTerminating }
+    var canQuery: Bool { installation?.isSupported == true && canReadWorkspace }
+    var canAnalyzeDisk: Bool { canQuery }
+    private var canReadWorkspace: Bool {
+        operationID == nil && cleanupID == nil && !isTerminating
+            && (!maintenance.isBusy || maintenance.phase == .scanning)
+    }
     var canInstallMole: Bool { moleNotInstalled && !isBusy && !isTerminating }
     var showsMoleInstallation: Bool { moleNotInstalled || installPhase != .idle }
     var isDetectingMole: Bool {
@@ -122,6 +133,7 @@ final class WorkspaceModel {
     func start() {
         guard !didStart else { return }
         didStart = true
+        operationHistory.load()
         if let snapshot = applicationCache?.load() {
             applications = snapshot.applications
             applicationsUpdatedAt = snapshot.updatedAt
@@ -197,12 +209,13 @@ final class WorkspaceModel {
     }
 
     func loadApplications() {
-        guard !isTerminating, !isBusy, let installation, installation.isSupported else { return }
+        guard canQuery, let installation else { return }
         cancelOperation()
         applicationsPhase = .loading
         applicationRefreshPhase = .idle
         applicationRefreshTarget = nil
-        refreshedApplications.removeAll()
+        let activity = OperationActivity(kind: .applicationList, title: hasApplicationSnapshot ? "刷新应用列表" : "读取应用列表", targetPath: nil)
+        queryActivity = activity
         let id = UUID()
         operationID = id
         operation = Task {
@@ -210,11 +223,11 @@ final class WorkspaceModel {
                 let result = try await applicationQuery(installation)
                 guard operationID == id, !Task.isCancelled else { return }
                 applications = result
-                refreshedApplications = Set(result)
                 if let selectedApplicationID, !result.contains(where: { $0.id == selectedApplicationID }) {
                     self.selectedApplicationID = nil
                 }
                 applicationsPhase = .loaded
+                operationHistory.record(activity.finished(.completed, summary: "已读取 \(result.count) 个应用。"))
                 let updatedAt = Date()
                 applicationsUpdatedAt = updatedAt
                 applicationCacheNotice = nil
@@ -226,25 +239,28 @@ final class WorkspaceModel {
             } catch {
                 guard operationID == id else { return }
                 applicationsPhase = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
+                operationHistory.record(activity.finished(error is CancellationError ? .cancelled : .failed,
+                    summary: error is CancellationError ? "读取已取消，保留上次列表。" : error.localizedDescription))
             }
             finish(id)
         }
     }
 
-    func isApplicationRefreshed(_ application: MoleApplication) -> Bool {
-        applications.contains(application) && refreshedApplications.contains(application)
+    func canPlanUninstall(_ application: MoleApplication) -> Bool {
+        applications.contains(application) && maintenance.canScan
     }
 
-    func canPlanUninstall(_ application: MoleApplication) -> Bool {
-        isApplicationRefreshed(application) && maintenance.canStart
+    func canRefreshApplication(_ application: MoleApplication) -> Bool {
+        canReadWorkspace && applications.contains(application)
     }
 
     func refreshApplication(_ application: MoleApplication) {
-        guard !isTerminating, !isBusy, applications.contains(application) else { return }
+        guard canRefreshApplication(application) else { return }
         cancelOperation()
-        refreshedApplications.remove(application)
         applicationRefreshTarget = application
         applicationRefreshPhase = .loading
+        let activity = OperationActivity(kind: .applicationRefresh, title: "刷新应用：\(application.name)", targetPath: application.path)
+        queryActivity = activity
         let id = UUID()
         operationID = id
         operation = Task {
@@ -255,11 +271,11 @@ final class WorkspaceModel {
                     throw MoleError.invalidResponse("单个应用路径")
                 }
                 applications[index] = result
-                refreshedApplications.insert(result)
                 applicationRefreshPhase = .loaded
+                operationHistory.record(activity.finished(.completed, summary: "已更新名称、Bundle ID 与占用信息（\(result.displaySize)）。"))
                 applicationCacheNotice = nil
                 do {
-                    // 单项刷新不冒充整张列表已更新，也不把本会话的核验标记写入缓存。
+                    // 单项刷新只更新此记录，保留完整列表更新时间。
                     if let updatedAt = applicationsUpdatedAt {
                         try applicationCache?.save(ApplicationListSnapshot(applications: applications, updatedAt: updatedAt))
                     }
@@ -269,18 +285,22 @@ final class WorkspaceModel {
             } catch {
                 guard operationID == id else { return }
                 applicationRefreshPhase = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
+                operationHistory.record(activity.finished(error is CancellationError ? .cancelled : .failed,
+                    summary: error is CancellationError ? "刷新已取消，保留原信息。" : error.localizedDescription))
             }
             finish(id)
         }
     }
 
     func analyze(directory: URL) {
-        guard !isTerminating, !isBusy, let installation, installation.isSupported else { return }
+        guard canAnalyzeDisk, let installation else { return }
         cancelOperation()
         requestedDirectory = directory.standardizedFileURL
         diskReport = nil
         selectedDiskEntryID = nil
         diskPhase = .loading
+        let activity = OperationActivity(kind: .diskAnalysis, title: "读取文件夹：\(directory.lastPathComponent)", targetPath: directory.standardizedFileURL.path)
+        queryActivity = activity
         let id = UUID()
         operationID = id
         operation = Task {
@@ -289,16 +309,20 @@ final class WorkspaceModel {
                 guard operationID == id, !Task.isCancelled else { return }
                 diskReport = result
                 diskPhase = .loaded
+                operationHistory.record(activity.finished(.completed,
+                    summary: "共 \(result.totalFiles) 个文件，占用 \(formattedBytes(result.totalSize))。仅读取占用，未执行移除。"))
             } catch {
                 guard operationID == id else { return }
                 diskPhase = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
+                operationHistory.record(activity.finished(error is CancellationError ? .cancelled : .failed,
+                    summary: error is CancellationError ? "读取已取消，未执行移除。" : error.localizedDescription))
             }
             finish(id)
         }
     }
 
     func chooseDirectory() {
-        guard canQuery else { return }
+        guard canAnalyzeDisk else { return }
         let panel = NSOpenPanel()
         panel.title = "选择要查看的文件夹"
         panel.prompt = "查看占用"
@@ -310,7 +334,7 @@ final class WorkspaceModel {
     }
 
     func goUp() {
-        guard canQuery, let directory = requestedDirectory, directory.path != "/" else { return }
+        guard canAnalyzeDisk, let directory = requestedDirectory, directory.path != "/" else { return }
         analyze(directory: directory.deletingLastPathComponent())
     }
 
@@ -318,6 +342,8 @@ final class WorkspaceModel {
         // 先使身份失效；取消返回后仍保留 busy，直到本次进程完成回收。
         operationID = nil
         guard let operation else { return }
+        let cancelledActivity = queryActivity
+        queryActivity = nil
         operation.cancel()
         self.operation = nil
         let id = UUID()
@@ -330,6 +356,9 @@ final class WorkspaceModel {
         cleanupTask = Task {
             await operation.value
             guard cleanupID == id else { return }
+            if let cancelledActivity {
+                operationHistory.record(cancelledActivity.finished(.cancelled, summary: "操作已取消，未更新查询结果。"))
+            }
             cleanupID = nil
             cleanupTask = nil
             if connectionPhase == .cancelling { connectionPhase = .cancelled }
@@ -342,6 +371,8 @@ final class WorkspaceModel {
 
     func prepareToTerminate(cancelMaintenance: Bool = true) async {
         isTerminating = true
+        // 先禁止新请求并取消所有只读任务，再等待各自收尾。
+        maintenance.stopRequests(cancelMaintenance: cancelMaintenance)
         cancelOperation()
         await cleanupTask?.value
         cleanupTask = nil
@@ -355,7 +386,7 @@ final class WorkspaceModel {
     }
 
     func openUninstallPlan(_ application: MoleApplication) {
-        // 单项或完整刷新只放行本会话已核验的具体记录，移除引擎仍会独立复核。
+        // 列表仅用于选择目标；维护引擎会独立核验当前路径、标识与安装集合。
         guard canPlanUninstall(application) else { return }
         page = .clean
         maintenance.planUninstall(application)
@@ -365,6 +396,7 @@ final class WorkspaceModel {
         guard operationID == id else { return }
         operationID = nil
         operation = nil
+        queryActivity = nil
     }
 
     private static func isMissingMole(_ error: any Error) -> Bool {
