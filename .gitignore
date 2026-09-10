@@ -10,3 +10,5 @@ xcuserdata/
 .env
 .env.*
 !.env.example
+.idea/
+docs/
