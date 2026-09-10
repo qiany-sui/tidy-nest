@@ -68,6 +68,7 @@ final class MaintenanceModel {
     @ObservationIgnored var canStartRequest: @MainActor () -> Bool = { true }
     @ObservationIgnored var canScanConcurrently: @MainActor () -> Bool = { false }
     @ObservationIgnored var beforeRequest: @MainActor () async -> Void = {}
+    @ObservationIgnored var onApplicationsTrashed: @MainActor (Set<String>) -> Void = { _ in }
     @ObservationIgnored private let actions: MaintenanceActions
     @ObservationIgnored private var operation: Task<Void, Never>?
     private var operationID: UUID?
@@ -224,6 +225,15 @@ final class MaintenanceModel {
                 result = value
                 operationHistory.record(OperationRecord(execution: value))
                 itemResults = value.items
+                // 执行收尾后同步已确认移除的本体；整体取消、部分失败或通信中断不抹掉已确认的逐项结果。
+                if plan.kind == .uninstall, value.planID == plan.planID {
+                    let removedPaths = Set(confirmation.items.filter { item in
+                        item.kind == .application && value.items.contains {
+                            $0.itemID == item.itemID && $0.path == item.path && $0.outcome == .trashed
+                        }
+                    }.map(\.path))
+                    if !removedPaths.isEmpty { onApplicationsTrashed(removedPaths) }
+                }
                 executionUncertain = value.status == .unknown
                 phase = .finished
             } catch {

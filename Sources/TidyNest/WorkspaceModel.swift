@@ -80,6 +80,9 @@ final class WorkspaceModel {
             let reading = [self.diskPhase, self.applicationsPhase, self.applicationRefreshPhase].contains(.loading)
             return self.operationID != nil && reading && self.cleanupID == nil && !self.isTerminating
         }
+        self.maintenance.onApplicationsTrashed = { [weak self] paths in
+            self?.removeTrashedApplications(at: paths)
+        }
         self.maintenance.beforeRequest = { [weak self] in
             // 执行和保护设置仍须等待查询收尾；只读检查可与应用、磁盘查询并行。
             await self?.cleanupTask?.value
@@ -243,6 +246,27 @@ final class WorkspaceModel {
                     summary: error is CancellationError ? "读取已取消，保留上次列表。" : error.localizedDescription))
             }
             finish(id)
+        }
+    }
+
+    private func removeTrashedApplications(at paths: Set<String>) {
+        guard applications.contains(where: { paths.contains($0.path) }) else { return }
+        applications.removeAll { paths.contains($0.path) }
+        if let selectedApplicationID, paths.contains(selectedApplicationID) {
+            self.selectedApplicationID = nil
+        }
+        if let applicationRefreshTarget, paths.contains(applicationRefreshTarget.path) {
+            self.applicationRefreshTarget = nil
+            applicationRefreshPhase = .idle
+        }
+        applicationCacheNotice = nil
+        do {
+            // 同步已确认的移除结果，不冒充一次完整列表刷新，也不重新扫描其他应用。
+            if let updatedAt = applicationsUpdatedAt {
+                try applicationCache?.save(ApplicationListSnapshot(applications: applications, updatedAt: updatedAt))
+            }
+        } catch {
+            applicationCacheNotice = "应用已移除，但列表未能保存；下次打开请刷新列表。"
         }
     }
 
