@@ -59,20 +59,70 @@ struct ApplicationRefreshServiceTests {
         await #expect(throws: (any Error).self) { try await ApplicationRefreshService().refresh(fixture.application) }
     }
 
-    @Test func wrapperReportsCurrentSupportLimitInsteadOfMissingApplication() async throws {
+    @Test func refreshesWrapperMetadataAndMeasuresOnlyTheOuterApplication() async throws {
         let fixture = try ApplicationRefreshFixture()
-        try FileManager.default.removeItem(at: fixture.info)
-        let payload = fixture.app.appendingPathComponent("Wrapper/CloudGame.app")
-        try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
-        try fixture.metadata.write(to: payload.appendingPathComponent("Info.plist"))
-        try FileManager.default.createSymbolicLink(atPath: fixture.app.appendingPathComponent("WrappedBundle").path, withDestinationPath: "Wrapper/CloudGame.app")
+        let payload = try fixture.makeWrapper()
+        let executable = try fixture.script(#"""
+        printf '%s\n' "$@" > "$0.args"
+        printf '123\t%s\n' "$2"
+        """#)
+        let refreshed = try await ApplicationRefreshService(duExecutable: executable, timeout: 3).refresh(fixture.application)
+        #expect(refreshed.name == "新的·测试 应用")
+        #expect(refreshed.bundleIdentifier == "com.example.Refreshed")
+        #expect(refreshed.path == fixture.app.path)
+        #expect(refreshed.source == fixture.application.source)
+        #expect(refreshed.uninstallName == fixture.application.uninstallName)
+        #expect(refreshed.displaySize == ByteCountFormatter.string(fromByteCount: 123 * 1024, countStyle: .file))
+        #expect(try String(contentsOfFile: executable.path + ".args", encoding: .utf8) == "-sk\n" + fixture.app.path + "\n")
+        #expect(try Data(contentsOf: payload.appendingPathComponent("Info.plist")) == fixture.metadata)
+    }
+
+    @Test(arguments: ["absolute", "escape", "double-slash", "payload-link", "info-link", "missing-payload", "corrupt", "oversized"])
+    func rejectsUnsafeOrIncompleteWrapperMetadata(_ kind: String) async throws {
+        let fixture = try ApplicationRefreshFixture()
+        let payload = try fixture.makeWrapper()
+        let wrapped = fixture.app.appendingPathComponent("WrappedBundle")
+        let info = payload.appendingPathComponent("Info.plist")
+        switch kind {
+        case "absolute", "escape", "double-slash":
+            try FileManager.default.removeItem(at: wrapped)
+            let target = kind == "absolute" ? payload.path : (kind == "escape" ? "Wrapper/../../outside.app" : "Wrapper//CloudGame.app")
+            try FileManager.default.createSymbolicLink(atPath: wrapped.path, withDestinationPath: target)
+        case "payload-link":
+            let outside = fixture.directory.appendingPathComponent("outside.app")
+            try FileManager.default.moveItem(at: payload, to: outside)
+            try FileManager.default.createSymbolicLink(at: payload, withDestinationURL: outside)
+        case "info-link":
+            let outside = fixture.directory.appendingPathComponent("outside.plist")
+            try FileManager.default.moveItem(at: info, to: outside)
+            try FileManager.default.createSymbolicLink(at: info, withDestinationURL: outside)
+        case "missing-payload": try FileManager.default.removeItem(at: payload)
+        case "corrupt": try Data("not a plist".utf8).write(to: info)
+        default: try Data(repeating: 1, count: 1024 * 1024 + 1).write(to: info)
+        }
+        let executable = try fixture.script("touch \"$0.started\"; exit 1")
+        await #expect(throws: (any Error).self) {
+            try await ApplicationRefreshService(duExecutable: executable, timeout: 3).refresh(fixture.application)
+        }
+        #expect(!FileManager.default.fileExists(atPath: executable.path + ".started"), "包装信息未安全读取时不能启动体积查询")
+    }
+
+    @Test(arguments: ["metadata", "wrapper", "payload"])
+    func wrapperChangedDuringSizeQueryDoesNotPublishMixedInformation(_ kind: String) async throws {
+        let fixture = try ApplicationRefreshFixture()
+        _ = try fixture.makeWrapper()
+        let body: String
+        switch kind {
+        case "metadata": body = #"printf changed > "$2/Wrapper/CloudGame.app/Info.plist""#
+        case "wrapper": body = #"rm "$2/WrappedBundle"; ln -s Wrapper/Other.app "$2/WrappedBundle""#
+        default: body = #"mv "$2/Wrapper/CloudGame.app" "$2/Wrapper/Other.app""#
+        }
+        let executable = try fixture.script(body + "\nprintf '4\\t%s\\n' \"$2\"")
         do {
-            _ = try await ApplicationRefreshService().refresh(fixture.application)
-            Issue.record("包装应用应说明当前不支持单项刷新")
+            _ = try await ApplicationRefreshService(duExecutable: executable, timeout: 3).refresh(fixture.application)
+            Issue.record("包装应用在刷新途中变化不能发布结果")
         } catch {
-            #expect(error.localizedDescription.contains("iPhone/iPad"))
-            #expect(error.localizedDescription.contains("暂不支持"))
-            #expect(!error.localizedDescription.contains("已缺失"))
+            #expect(error.localizedDescription.contains("发生变化"))
         }
     }
 
@@ -101,8 +151,10 @@ struct ApplicationRefreshServiceTests {
         await #expect(throws: CancellationError.self) { try await task.value }
     }
 
-    @Test func cancellationDuringSizeQueryStopsItsProcess() async throws {
+    @Test(arguments: [false, true])
+    func cancellationDuringSizeQueryStopsItsProcess(_ wrapped: Bool) async throws {
         let fixture = try ApplicationRefreshFixture()
+        if wrapped { _ = try fixture.makeWrapper() }
         let executable = try fixture.script(#"""
         echo $$ > "$2/Contents/du-pid"
         exec /bin/sleep 30
@@ -204,6 +256,15 @@ private struct ApplicationRefreshFixture {
 
     func application(at path: String) -> MoleApplication {
         MoleApplication(name: "Old", bundleIdentifier: "unknown", source: "App", uninstallName: "old-uninstall-name", path: path, displaySize: "未知")
+    }
+
+    func makeWrapper() throws -> URL {
+        try FileManager.default.removeItem(at: info)
+        let payload = app.appendingPathComponent("Wrapper/CloudGame.app")
+        try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
+        try metadata.write(to: payload.appendingPathComponent("Info.plist"))
+        try FileManager.default.createSymbolicLink(atPath: app.appendingPathComponent("WrappedBundle").path, withDestinationPath: "Wrapper/CloudGame.app")
+        return payload
     }
 
     func script(_ body: String) throws -> URL {

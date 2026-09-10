@@ -28,17 +28,43 @@ public struct ApplicationRefreshService: Sendable {
         guard root >= 0 else { throw ApplicationRefreshFailure("无法读取所选应用包，应用可能已移动、不可访问或包含路径链接。") }
         defer { close(root) }
         let rootIdentity = try ApplicationRefreshIdentity(descriptor: root)
-        let infoPath = path + "/Contents/Info.plist"
-        let info = open(infoPath, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK)
-        guard info >= 0 else {
+        var infoPath = path + "/Contents/Info.plist"
+        var info = open(infoPath, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK)
+        var payloadPath: String?
+        var payload: Int32 = -1
+        defer { if payload >= 0 { close(payload) } }
+        if info < 0, errno == ENOENT {
             var wrapper = stat()
-            if errno == ENOENT, lstat(path + "/WrappedBundle", &wrapper) == 0, wrapper.st_mode & S_IFMT == S_IFLNK {
-                throw ApplicationRefreshFailure("这是 iPhone/iPad 包装应用，当前版本暂不支持单独刷新此类应用。")
+            guard fstatat(root, "WrappedBundle", &wrapper, AT_SYMLINK_NOFOLLOW) == 0,
+                  wrapper.st_mode & S_IFMT == S_IFLNK else {
+                throw ApplicationRefreshFailure("无法安全读取此应用的 Info.plist，请确认应用安装完整。")
             }
-            throw ApplicationRefreshFailure("无法安全读取此应用的 Info.plist，请确认应用安装完整。")
+            // 只读取包装链接的文本，再用无链接路径打开包内元数据，不跟随任意链接。
+            var bytes = [CChar](repeating: 0, count: 4096)
+            let count = bytes.withUnsafeMutableBufferPointer { buffer in
+                readlinkat(root, "WrappedBundle", buffer.baseAddress, buffer.count)
+            }
+            guard count > 0, count < bytes.count,
+                  let target = String(bytes: bytes.prefix(count).map { UInt8(bitPattern: $0) }, encoding: .utf8),
+                  !target.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+                throw ApplicationRefreshFailure("包装应用的位置无法完整识别。")
+            }
+            let components = target.split(separator: "/", omittingEmptySubsequences: false)
+            guard components.count == 2, components[0] == "Wrapper",
+                  components[1].hasSuffix(".app"), components[1].count > 4 else {
+                throw ApplicationRefreshFailure("包装应用的链接不在支持的包内位置。")
+            }
+            let location = path + "/" + target
+            payload = open(location, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+            guard payload >= 0 else { throw ApplicationRefreshFailure("包装应用内容不可访问或包含路径链接。") }
+            payloadPath = location
+            infoPath = location + "/Info.plist"
+            info = open(infoPath, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK)
         }
+        guard info >= 0 else { throw ApplicationRefreshFailure("无法安全读取此应用的 Info.plist，请确认应用安装完整。") }
         defer { close(info) }
         let infoIdentity = try ApplicationRefreshIdentity(descriptor: info)
+        let payloadIdentity = payload >= 0 ? try ApplicationRefreshIdentity(descriptor: payload) : nil
         let maximumBytes = 1024 * 1024
         guard infoIdentity.mode & S_IFMT == S_IFREG, infoIdentity.size >= 0, infoIdentity.size <= maximumBytes else {
             throw ApplicationRefreshFailure("应用 Info.plist 的类型或大小不符合读取要求。")
@@ -66,6 +92,7 @@ public struct ApplicationRefreshService: Sendable {
             ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         try rootIdentity.verify(at: path, descriptor: root)
         try infoIdentity.verify(at: infoPath, descriptor: info)
+        if let payloadPath, let payloadIdentity { try payloadIdentity.verify(at: payloadPath, descriptor: payload) }
         // du 默认不跟随包内链接；只传所选包的绝对路径，不读取同级应用或 Mole 列表。
         let output: ProcessOutput
         do {
@@ -89,6 +116,7 @@ public struct ApplicationRefreshService: Sendable {
         // 不把刷新前的名称与刷新途中被替换的应用体积拼成一个结果。
         try rootIdentity.verify(at: path, descriptor: root)
         try infoIdentity.verify(at: infoPath, descriptor: info)
+        if let payloadPath, let payloadIdentity { try payloadIdentity.verify(at: payloadPath, descriptor: payload) }
         try Task.checkCancellation()
         return MoleApplication(name: name, bundleIdentifier: identifier, source: application.source,
                                uninstallName: application.uninstallName, path: path,
