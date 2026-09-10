@@ -1037,3 +1037,140 @@ func mismatchedApplicationIDRemainsBlockedWithAccurateReason(_ expectedID: Strin
     #expect(issue.reason.contains("未找到"))
     #expect(!issue.reason.contains("标识变化"))
 }
+
+
+@Test(arguments: ["application", "parent"])
+func uninstallPlanBlocksMissingMovePermission(_ target: String) async throws {
+    let fixture = try Fixture()
+    let restricted = target == "application" ? fixture.app : fixture.app.deletingLastPathComponent()
+    #expect(chmod(restricted.path, 0o555) == 0)
+    defer { _ = chmod(restricted.path, 0o755) }
+    let before = try ObjectSnapshot.capture(fixture.app.path, application: true)
+    let engine = fixture.engine()
+    let plan = try await uninstall(engine, fixture: fixture)
+    let body = try #require(plan.items.first { $0.kind == .application })
+    #expect(body.selection == .blocked)
+    #expect(body.blockedReason?.contains("权限") == true)
+    #expect(body.blockedReason?.contains("Finder") == true)
+    #expect(try await apply(engine, plan, [body.itemID]).status == .blocked)
+    #expect(before.matches(try ObjectSnapshot.capture(fixture.app.path, application: true)))
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+    let consumed = fixture.home.appendingPathComponent("Library/Application Support/TidyNest/Engine/Consumed")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: consumed.path).isEmpty)
+}
+
+@Test func readonlyApplicationStillAllowsIndependentCacheCleaning() async throws {
+    let fixture = try Fixture()
+    let cache = try fixture.file("selected.cache", "only cache")
+    #expect(chmod(fixture.app.path, 0o555) == 0)
+    defer { _ = chmod(fixture.app.path, 0o755) }
+    let before = try ObjectSnapshot.capture(fixture.app.path, application: true)
+    let engine = fixture.engine()
+    let plan = try await scan(engine)
+    #expect(plan.items.map(\.path) == [cache.path])
+    #expect(try await apply(engine, plan, plan.items.map(\.itemID)).status == .completed)
+    #expect(before.matches(try ObjectSnapshot.capture(fixture.app.path, application: true)))
+}
+
+@Test func movePermissionLossReportsCauseAndPreservesApplicationDependencies() async throws {
+    let fixture = try Fixture()
+    let cache = try fixture.file("dependent.cache", "keep cache")
+    defer { _ = chmod(fixture.app.path, 0o755) }
+    let engine = MaintenanceEngine(context: fixture.context(hook: { stage, original, _ in
+        if stage == .beforeMove && original == fixture.app.path {
+            #expect(chmod(original, 0o555) == 0)
+        }
+    }))
+    let plan = try await uninstall(engine, fixture: fixture)
+    #expect(plan.items.count == 2)
+    #expect(plan.items.first { $0.kind == .application }?.selection == .required)
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    let body = try #require(result.items.first { $0.path == fixture.app.path })
+    #expect(body.outcome == .failed)
+    #expect(body.reason?.contains("权限") == true)
+    #expect(body.reason?.contains("系统错误 13") == true)
+    #expect(body.retainedPath == fixture.app.path)
+    #expect(result.items.first { $0.path == cache.path }?.outcome == .skipped)
+    #expect(try String(contentsOf: cache, encoding: .utf8) == "keep cache")
+    #expect(FileManager.default.fileExists(atPath: fixture.app.appendingPathComponent("Contents/Info.plist").path))
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+}
+
+@Test func stagingCollisionReportsCauseWithoutOverwritingEitherObject() async throws {
+    let fixture = try Fixture()
+    let before = try ObjectSnapshot.capture(fixture.app.path, application: true)
+    let engine = MaintenanceEngine(context: fixture.context(hook: { stage, _, staged in
+        if stage == .beforeMove {
+            let destination = URL(fileURLWithPath: staged)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            try Data("keep existing".utf8).write(to: destination.appendingPathComponent("sentinel"))
+        }
+    }))
+    let plan = try await uninstall(engine, fixture: fixture)
+    let result = try await apply(engine, plan, plan.items.map(\.itemID))
+    #expect(result.status == .failed)
+    #expect(result.trashedBytes == 0)
+    #expect(result.items.first?.reason?.contains("系统错误 17") == true)
+    #expect(before.matches(try ObjectSnapshot.capture(fixture.app.path, application: true)))
+    let item = try #require(plan.items.first)
+    let staged = fixture.home.appendingPathComponent("Library/Application Support/TidyNest/Engine/Transactions/\(result.runID)/\(item.itemID)/Fixture.app/sentinel")
+    #expect(try String(contentsOf: staged, encoding: .utf8) == "keep existing")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+}
+
+@Test(arguments: ["application", "parent"])
+func applicationMoveDoesNotRequireUnrelatedACLAddFilePermission(_ target: String) async throws {
+    let fixture = try Fixture()
+    let restricted = target == "application" ? fixture.app : fixture.app.deletingLastPathComponent()
+    let chmodProcess = Process()
+    chmodProcess.executableURL = URL(fileURLWithPath: "/bin/chmod")
+    chmodProcess.arguments = ["+a", "user:\(NSUserName()) deny add_file", restricted.path]
+    try chmodProcess.run()
+    chmodProcess.waitUntilExit()
+    try #require(chmodProcess.terminationStatus == 0)
+    let directory = try DirectoryFD(path: restricted.path)
+    #expect(faccessat(directory.fd, ".", W_OK, AT_EACCESS) != 0)
+    let engine = fixture.engine()
+    let plan = try await uninstall(engine, fixture: fixture)
+    let body = try #require(plan.items.first { $0.kind == .application })
+    #expect(body.selection == .required)
+    let result = try await apply(engine, plan, [body.itemID])
+    #expect(result.status == .completed)
+    #expect(!FileManager.default.fileExists(atPath: fixture.app.path))
+    let destination = try #require(result.items.first?.trashPath)
+    #expect(FileManager.default.fileExists(atPath: destination + "/Contents/Info.plist"))
+}
+
+@Test func uninstallPlanBlocksACLDeletionDenialDespiteWritableModes() async throws {
+    let fixture = try Fixture()
+    for (url, permission) in [(fixture.app, "delete"), (fixture.app.deletingLastPathComponent(), "delete_child")] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        process.arguments = ["+a", "user:\(NSUserName()) deny \(permission)", url.path]
+        try process.run()
+        process.waitUntilExit()
+        try #require(process.terminationStatus == 0)
+        let directory = try DirectoryFD(path: url.path)
+        #expect(faccessat(directory.fd, ".", W_OK, AT_EACCESS) == 0)
+    }
+    let before = try ObjectSnapshot.capture(fixture.app.path, application: true)
+    let plan = try await uninstall(fixture.engine(), fixture: fixture)
+    let body = try #require(plan.items.first { $0.kind == .application })
+    #expect(body.selection == .blocked)
+    #expect(body.blockedReason?.contains("权限") == true)
+    #expect(before.matches(try ObjectSnapshot.capture(fixture.app.path, application: true)))
+}
+
+@Test func missingMovePermissionIsExplainedBeforeTransientOccupancy() async throws {
+    let fixture = try Fixture()
+    #expect(chmod(fixture.app.path, 0o555) == 0)
+    defer { _ = chmod(fixture.app.path, 0o755) }
+    let engine = MaintenanceEngine(context: fixture.context(runtime: { _, _ in
+        throw EngineFailure("后台进程暂时占用，请关闭相关窗口。")
+    }))
+    let plan = try await uninstall(engine, fixture: fixture)
+    let body = try #require(plan.items.first { $0.kind == .application })
+    #expect(body.selection == .blocked)
+    #expect(body.blockedReason?.contains("权限") == true)
+    #expect(body.blockedReason?.contains("Finder") == true)
+}

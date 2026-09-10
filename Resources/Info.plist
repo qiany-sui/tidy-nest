@@ -14,6 +14,7 @@
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSAppleEventsUsageDescription</key><string>仅在你确认移除需要系统授权的应用时，请求 Finder 将该应用移入废纸篓。</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>

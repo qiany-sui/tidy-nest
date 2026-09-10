@@ -287,6 +287,9 @@ private enum MaintenanceValidation {
     static func item(_ item: MaintenanceItem) throws {
         try path(item.path)
         guard !item.itemID.isEmpty, !item.ruleID.isEmpty else { throw MaintenanceError.invalidResponse("项目标识缺失。") }
+        if item.requiresAuthorization == true {
+            guard item.kind == .application, item.selection == .required, item.blockedReason == nil else { throw MaintenanceError.invalidResponse("系统授权标识只能用于可移除的应用本体。") }
+        }
     }
     static func itemResult(_ result: MaintenanceItemResult) throws {
         try path(result.path)

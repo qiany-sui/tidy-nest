@@ -35,6 +35,8 @@ struct EngineContext: Sendable {
     let trash: @Sendable (URL) throws -> URL
     let hook: @Sendable (ExecutionBoundary, String, String) throws -> Void
     let environment: @Sendable () -> [String: String]
+    var authorizedTrash: (@Sendable (URL, ObjectSnapshot) async throws -> URL)? = nil
+    var authorizedTrashRoot: String? = nil
     static func production() -> Self {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return Self(home: home, appRoots: ["/Applications", home + "/Applications"], catalog: {
@@ -84,7 +86,9 @@ struct EngineContext: Sendable {
             try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
             guard let result = resulting as URL? else { throw EngineFailure("系统未返回废纸篓位置，需要人工核对。") }
             return result
-        }, hook: { _, _, _ in }, environment: { ProcessInfo.processInfo.environment })
+        }, hook: { _, _, _ in }, environment: { ProcessInfo.processInfo.environment }, authorizedTrash: { url, snapshot in
+            try await FinderTrashService.trash(url, snapshot: snapshot)
+        }, authorizedTrashRoot: home + "/.Trash")
     }
 }
 

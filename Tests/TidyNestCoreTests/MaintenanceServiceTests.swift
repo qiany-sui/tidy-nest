@@ -6,6 +6,25 @@ import TidyNestProtocol
 
 @Suite(.serialized)
 struct MaintenanceServiceTests {
+    @Test func fileCandidatesCannotRequestSystemAuthorization() async throws {
+        var event = finalPlan()
+        var plan = event["plan"] as! [String: Any]
+        plan["items"] = [["itemID": "file", "ruleID": "cache", "path": "/tmp/fixture/cache",
+                         "displayName": "缓存", "kind": "file", "action": "trashItem",
+                         "reason": "缓存", "impact": "重新生成", "selection": "optional",
+                         "dependsOnItemIDs": [], "requiresAuthorization": true]]
+        event["plan"] = plan
+        let fixture = try BridgeFixture("/bin/cat > /dev/null\n/bin/cat \"${0}.response\"")
+        defer { fixture.remove() }
+        try events([progress(), event]).write(to: fixture.response)
+        do {
+            _ = try await MaintenanceService(executableURL: fixture.script).scanClean { _ in }
+            Issue.record("普通缓存文件不得获得系统授权通道")
+        } catch let error as MaintenanceError {
+            #expect(error.localizedDescription.contains("系统授权"))
+        }
+    }
+
     @Test func bridgeEarlyResourceFailureProducesOneTerminalEventBeforeAnyAction() async throws {
         let fixture = try BridgeFixture("exit 99")
         defer { fixture.remove() }

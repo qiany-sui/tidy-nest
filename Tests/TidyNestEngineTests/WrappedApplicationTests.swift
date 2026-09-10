@@ -417,3 +417,24 @@ func wrappedContainerDuplicateAtMoveBoundaryPreservesFile(_ boundary: ExecutionB
     #expect(count > 0)
     #expect(String(decoding: bytes.prefix(max(0, count)), as: UTF8.self) == "read-only fixture")
 }
+
+
+@Test func readonlyWrappedApplicationIsBlockedBeforeExecution() async throws {
+    let fixture = try WrapperFixture()
+    let cache = try fixture.file("Library/Caches/\(fixture.bundleID)/keep.cache")
+    #expect(chmod(fixture.app.path, 0o555) == 0)
+    defer { _ = chmod(fixture.app.path, 0o755) }
+    let before = try ObjectSnapshot.capture(fixture.app.path, application: true)
+    let engine = MaintenanceEngine(context: fixture.context())
+    let plan = try await fixture.plan(engine)
+    #expect(plan.scanComplete)
+    #expect(plan.items.count == 1)
+    let body = try #require(plan.items.first)
+    #expect(body.path == fixture.app.path)
+    #expect(body.selection == .blocked)
+    #expect(body.blockedReason?.contains("权限") == true)
+    #expect(body.blockedReason?.contains("Finder") == true)
+    #expect(try await fixture.apply(engine, plan: plan, paths: [fixture.app.path]).status == .blocked)
+    #expect(before.matches(try ObjectSnapshot.capture(fixture.app.path, application: true)))
+    #expect(try String(contentsOf: cache, encoding: .utf8) == "fixture data")
+}

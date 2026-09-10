@@ -178,6 +178,7 @@ public actor MaintenanceEngine {
             let hasUniqueOwner = groups[app.bundleID.lowercased()]?.count == 1
             let bodyOnly = !hasUniqueOwner || app.bundleID.lowercased() == EngineRules.xcodeBundleID
             var block: String?
+            var requiresAuthorization = false
             // 应用本体由精确路径和完整快照定位；共享缓存与日志仍要求唯一归属。
             if !uninstall && !hasUniqueOwner { block = "bundle ID 安装归属不唯一，共享缓存与日志已保留。" }
             if !validBundle(app.bundleID) { block = app.unsupportedReason ?? "bundle ID 不完整，不授权维护动作。" }
@@ -188,6 +189,13 @@ public actor MaintenanceEngine {
                 do {
                     guard try bundleID(at: app.path) == app.bundleID else { throw EngineFailure("应用标识已变化。") }
                     _ = try DirectoryFD(path: app.path)
+                    if uninstall {
+                        do { try verifyApplicationMovePermissions(app.path) }
+                        catch let error as ApplicationMovePermissionError where error.code == EACCES && context.authorizedTrash != nil && context.authorizedTrashRoot != nil {
+                            // 系统授权只补足普通权限，运行状态、保护规则和完整快照仍须通过。
+                            requiresAuthorization = true
+                        }
+                    }
                     try await context.runtime(app, app.path)
                 } catch { block = error.localizedDescription }
             }
@@ -198,7 +206,7 @@ public actor MaintenanceEngine {
                     do { snapshot = try ObjectSnapshot.capture(app.path, application: true) }
                     catch { block = error.localizedDescription }
                 }
-                let item = MaintenanceItem(itemID: id, ruleID: EngineRules.ids[2], path: app.path, displayName: app.name, kind: .application, action: .trashItem, estimatedBytes: snapshot?.bytes, reason: app.isWrapped ? "移除选定的 iPhone/iPad 包装应用本体（整个外层应用包）" : "移除选定的普通应用本体", impact: bodyOnly ? "只移除当前路径的应用本体，缓存与日志保留；可从废纸篓手动恢复。" : (app.isWrapped ? "应用将无法启动，可从废纸篓手动恢复。文稿、存档、偏好设置及共享容器保留；缓存与日志单独选择。" : "应用将无法启动，可从废纸篓手动恢复。相关缓存与日志单独选择。"), selection: block == nil ? .required : .blocked, blockedReason: block, dependsOnItemIDs: [])
+                let item = MaintenanceItem(itemID: id, ruleID: EngineRules.ids[2], path: app.path, displayName: app.name, kind: .application, action: .trashItem, estimatedBytes: snapshot?.bytes, reason: app.isWrapped ? "移除选定的 iPhone/iPad 包装应用本体（整个外层应用包）" : "移除选定的普通应用本体", impact: bodyOnly ? "只移除当前路径的应用本体，缓存与日志保留；可从废纸篓手动恢复。" : (app.isWrapped ? "应用将无法启动，可从废纸篓手动恢复。文稿、存档、偏好设置及共享容器保留；缓存与日志单独选择。" : "应用将无法启动，可从废纸篓手动恢复。相关缓存与日志单独选择。"), selection: block == nil ? .required : .blocked, blockedReason: block, dependsOnItemIDs: [], requiresAuthorization: block == nil && requiresAuthorization ? true : nil)
                 items.append(item); owners[id] = app
                 if let snapshot { snapshots[id] = snapshot }
             }
@@ -323,6 +331,9 @@ public actor MaintenanceEngine {
         for item in plan.items {
             guard item.selection != .blocked, item.blockedReason == nil, item.action == .trashItem, UUID(uuidString: item.itemID) != nil, let owner = saved.owners[item.itemID], saved.snapshots[item.itemID] != nil, Set(item.dependsOnItemIDs).isSubset(of: selected) else { throw EngineFailure("计划项目已阻止、快照缺失或依赖未选中。") }
             _ = try canonicalPath(item.path)
+            if item.requiresAuthorization == true {
+                guard item.kind == .application, plan.kind == .uninstall, context.authorizedTrash != nil, context.authorizedTrashRoot != nil else { throw EngineFailure("系统授权仅用于已确认的应用本体，当前环境不支持此计划。") }
+            }
             guard saved.catalogRecords.contains(where: { $0.app == owner }) else { throw EngineFailure("项目归属未绑定到计划中的安装集合。") }
             if item.kind == .application {
                 guard plan.kind == .uninstall, item.selection == .required, item.ruleID == EngineRules.ids[2], item.path == owner.path, context.appRoots.contains(where: { pathInside(item.path, $0) && item.path != $0 }), item.path.hasSuffix(".app"), item.dependsOnItemIDs.isEmpty else { throw EngineFailure("应用计划范围不合法。") }
@@ -381,12 +392,18 @@ public actor MaintenanceEngine {
                     let container = [EngineRules.ids[3], EngineRules.ids[4]].contains(item.ruleID) ? saved.containerOwners[saved.owners[item.itemID]!.path] : nil
                     try await context.runtime(owner, item.path)
                     if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
-                    result = try move(item, snapshot: saved.snapshots[item.itemID]!, container: container, store: store, runID: stream.runID)
+                    if item.requiresAuthorization == true {
+                        stream.send(.progress, message: "正在交给 Finder 移除 " + item.displayName + "；请在系统窗口完成授权或取消。")
+                        result = try await moveWithSystemAuthorization(item, snapshot: saved.snapshots[item.itemID]!, store: store, runID: stream.runID)
+                    } else {
+                        result = try move(item, snapshot: saved.snapshots[item.itemID]!, container: container, store: store, runID: stream.runID)
+                    }
                 } catch {
                     if error is CancellationError { cancellationObserved = true }
                     result = itemResult(item, error is CancellationError ? .cancelled : .failed, error.localizedDescription, retained: item.path)
                 }
             }
+            if result.outcome == .cancelled { cancellationObserved = true }
             results.append(result)
             progress.items = results
             try journal(store, stream.runID, state: "itemResult", item: item, result: result)
@@ -400,11 +417,50 @@ public actor MaintenanceEngine {
         return result
     }
 
+    private func moveWithSystemAuthorization(_ item: MaintenanceItem, snapshot: ObjectSnapshot, store: EngineStore, runID: String) async throws -> MaintenanceItemResult {
+        guard item.kind == .application, let operation = context.authorizedTrash, let trashRoot = context.authorizedTrashRoot else { throw EngineFailure("当前环境不能请求系统授权。") }
+        _ = try canonicalPath(trashRoot)
+        guard snapshot.matches(try ObjectSnapshot.capture(item.path, application: true)) else { throw EngineFailure("应用或父目录发生变化，请重新检查。") }
+        guard snapshot.members.first?.identity.device == (try identity(at: store.root)).device else { throw EngineFailure("应用与本用户维护目录不在同一卷，已保留。") }
+        try checkCancelled()
+        // 授权和移动由 Finder 完成；交接后任何通信不确定都不能当作“尚未执行”重试。
+        try journal(store, runID, state: "systemTrashIntent", item: item, retained: item.path)
+        var returnedPath: String?
+        do {
+            let destination = try await operation(URL(fileURLWithPath: item.path), snapshot)
+            returnedPath = destination.path
+            let normalizedDestination = try canonicalPath(destination.path)
+            let isExpectedTrash = destination.isFileURL && pathInside(normalizedDestination, trashRoot) && normalizedDestination != trashRoot
+            guard isExpectedTrash, try existingIdentity(item.path) == nil,
+                  snapshot.matches(try ObjectSnapshot.captureFinalLocation(destination.path, application: true), moved: true) else {
+                throw SystemTrashError.uncertain("系统返回的位置或应用身份未通过复核。")
+            }
+            let result = itemResult(item, .trashed, "已由 Finder 完成系统移除并核验应用身份。", trash: destination.path)
+            try journal(store, runID, state: "succeeded", item: item, result: result)
+            return result
+        } catch {
+            let unchanged = (try? ObjectSnapshot.capture(item.path, application: true)).map { snapshot.matches($0) } ?? false
+            let outcome: ItemOutcome
+            switch error {
+            case SystemTrashError.cancelled, SystemTrashError.denied, is CancellationError:
+                outcome = unchanged && returnedPath == nil ? .cancelled : .unknown
+            case SystemTrashError.uncertain:
+                outcome = .unknown
+            default:
+                outcome = unchanged && returnedPath == nil ? .failed : .unknown
+            }
+            let result = itemResult(item, outcome, error.localizedDescription, trash: returnedPath, retained: FileManager.default.fileExists(atPath: item.path) ? item.path : nil)
+            try? journal(store, runID, state: outcome == .unknown ? "needsReview" : "systemTrashStopped", item: item, retained: result.retainedPath, result: result)
+            return result
+        }
+    }
+
     private func move(_ item: MaintenanceItem, snapshot: ObjectSnapshot, container: ContainerOwnership?, store: EngineStore, runID: String) throws -> MaintenanceItemResult {
         guard snapshot.matches(try ObjectSnapshot.capture(item.path, application: item.kind == .application)) else { throw EngineFailure("目标、父目录或应用成员已变化，请重新生成计划。") }
         let sourceURL = URL(fileURLWithPath: item.path)
         let source = try DirectoryFD(path: sourceURL.deletingLastPathComponent().path)
         guard source.identities.count == snapshot.parents.count, zip(source.identities, snapshot.parents).allSatisfy({ $0.sameDirectory($1) }) else { throw EngineFailure("父目录身份已变化。") }
+        if item.kind == .application { try verifyApplicationMovePermissions(item.path) }
         let runDirectory = store.root + "/Transactions/" + runID
         try EngineStore.privateDirectory(runDirectory)
         let itemDirectory = runDirectory + "/" + item.itemID
@@ -416,7 +472,21 @@ public actor MaintenanceEngine {
         try context.hook(.beforeMove, item.path, staged)
         try container?.verifyUnique(home: context.home, checkCancelled: checkCancelled)
         // macOS 没有以源 inode 为条件的 rename；移后复验只能检测可观察到的竞争变化。
-        guard renameatx_np(source.fd, sourceURL.lastPathComponent, destination.fd, sourceURL.lastPathComponent, UInt32(RENAME_EXCL)) == 0 else { throw EngineFailure("无法独占移入暂存区，源文件保留。") }
+        guard renameatx_np(source.fd, sourceURL.lastPathComponent, destination.fd, sourceURL.lastPathComponent, UInt32(RENAME_EXCL)) == 0 else {
+            let code = errno
+            let reason: String
+            switch code {
+            case EACCES:
+                reason = "当前账户没有移动此项目的权限，源文件保留。请在 Finder 中核对权限，或按系统提示授权移除。"
+            case EPERM:
+                reason = "系统拒绝移动此项目，源文件保留。可能受系统保护或应用管理权限限制，请在 Finder 中核对。"
+            case EEXIST:
+                reason = "暂存位置已存在同名项目，未覆盖；源文件保留。请重新检查后重试。"
+            default:
+                reason = "无法移入暂存区，移动未完成。请重新检查。"
+            }
+            throw EngineFailure("\(reason)（系统错误 \(code)：\(String(cString: strerror(code)))）")
+        }
         var knownTrash: String?
         do {
             guard fsync(source.fd) == 0, fsync(destination.fd) == 0 else { throw EngineFailure("暂存目录未能同步。") }

@@ -31,9 +31,10 @@ public struct MaintenanceItem: Codable, Sendable, Hashable, Identifiable {
     public let selection: PlanSelection
     public let blockedReason: String?
     public let dependsOnItemIDs: [String]
+    public let requiresAuthorization: Bool?
     public var id: String { itemID }
 
-    public init(itemID: String, ruleID: String, path: String, displayName: String, kind: MaintenanceItemKind, action: MaintenanceAction, estimatedBytes: UInt64?, reason: String, impact: String, selection: PlanSelection, blockedReason: String?, dependsOnItemIDs: [String]) {
+    public init(itemID: String, ruleID: String, path: String, displayName: String, kind: MaintenanceItemKind, action: MaintenanceAction, estimatedBytes: UInt64?, reason: String, impact: String, selection: PlanSelection, blockedReason: String?, dependsOnItemIDs: [String], requiresAuthorization: Bool? = nil) {
         self.itemID = itemID
         self.ruleID = ruleID
         self.path = path
@@ -46,6 +47,7 @@ public struct MaintenanceItem: Codable, Sendable, Hashable, Identifiable {
         self.selection = selection
         self.blockedReason = blockedReason
         self.dependsOnItemIDs = dependsOnItemIDs
+        self.requiresAuthorization = requiresAuthorization
     }
 }
 

@@ -107,6 +107,24 @@ final class DirectoryFD {
     }
 }
 
+struct ApplicationMovePermissionError: Error, LocalizedError {
+    let code: Int32
+    var errorDescription: String? {
+        "当前账户没有移动此应用所需的权限。应用已保留；如需移除，请在 Finder 中操作并按系统提示授权。（系统错误 \(code)）"
+    }
+}
+
+// 目录跨父目录 rename 核验 DELETE 与 ADD_SUBDIRECTORY；W_OK 还要求 ADD_FILE，会误拒绝部分 ACL。
+// 传入父目录 FD 和具体名称，让系统同时核验本体与父目录的删除授权，不自行推算 POSIX/ACL。
+func verifyApplicationMovePermissions(_ path: String) throws {
+    let url = URL(fileURLWithPath: try canonicalPath(path))
+    let parent = try DirectoryFD(path: url.deletingLastPathComponent().path)
+    guard faccessat(parent.fd, url.lastPathComponent, _DELETE_OK | _APPEND_OK, AT_EACCESS | AT_SYMLINK_NOFOLLOW) == 0 else {
+        let code = errno
+        throw ApplicationMovePermissionError(code: code)
+    }
+}
+
 // 缺省仅接受确证的 ENOENT；不能将权限拒绝或悬空链接伪装成“不存在”。
 func existingIdentity(_ path: String) throws -> FileIdentity? {
     let components = try canonicalPath(path).split(separator: "/").map(String.init)
