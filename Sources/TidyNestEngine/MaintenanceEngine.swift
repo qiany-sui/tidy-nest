@@ -300,12 +300,10 @@ public actor MaintenanceEngine {
                     var bytes = [UInt8](repeating: 0, count: 16)
                     let count = Darwin.read(fd, &bytes, 16); close(fd)
                     guard count >= 0 else { throw EngineFailure("无法核验文件内容类型。") }
-                    if Data(bytes.prefix(max(0, count))).starts(with: Data("SQLite format 3".utf8)) {
-                        issues.append(PlanIssue(path: path, reason: "SQLite 数据库已保留。")); continue
-                    }
+                    let isSQLite = Data(bytes.prefix(max(0, count))).starts(with: Data("SQLite format 3".utf8))
                     guard snapshot.matches(try ObjectSnapshot.capture(path, application: false)) else { throw EngineFailure("扫描期间文件发生变化。") }
                     let id = UUID().uuidString
-                    let item = MaintenanceItem(itemID: id, ruleID: rule, path: path, displayName: name, kind: .file, action: .trashItem, estimatedBytes: snapshot.bytes, reason: "\([EngineRules.ids[3], EngineRules.ids[4]].contains(rule) ? "容器元数据确认归属" : "精确匹配") \(app.bundleID) 的普通\([EngineRules.ids[0], EngineRules.ids[3]].contains(rule) ? "缓存" : "日志")文件", impact: "移入废纸篓；缓存可能重新生成，日志移走后历史排错记录不可直接读取。", selection: .optional, blockedReason: nil, dependsOnItemIDs: dependencies)
+                    let item = MaintenanceItem(itemID: id, ruleID: rule, path: path, displayName: name, kind: .file, action: .trashItem, estimatedBytes: snapshot.bytes, reason: "\([EngineRules.ids[3], EngineRules.ids[4]].contains(rule) ? "容器元数据确认归属" : "精确匹配") \(app.bundleID) 的普通\([EngineRules.ids[0], EngineRules.ids[3]].contains(rule) ? "缓存" : "日志")文件", impact: rules.fileImpact(path, isSQLite: isSQLite), selection: .optional, blockedReason: nil, dependsOnItemIDs: dependencies)
                     items.append(item); snapshots[id] = snapshot; owners[id] = app
                 } catch { complete = false; issues.append(PlanIssue(path: path, reason: error.localizedDescription)) }
             }

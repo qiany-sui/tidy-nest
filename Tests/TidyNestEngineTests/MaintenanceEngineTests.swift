@@ -78,6 +78,102 @@ private func apply(_ engine: MaintenanceEngine, _ plan: MaintenancePlan, _ ids: 
     #expect(result.items.first?.trashPath != nil)
 }
 
+@Test(arguments: ["Cache.db", "Cache.db-shm", "Cache.db-wal", "state.sqlite", "state.sqlite3", "keychain.dat", "credential.json", "session.json", "Cookies", "Preferences/state", "Local Storage/state", "IndexedDB/state"])
+func persistentCacheFilesAreOptionalWithExplicitImpact(_ name: String) async throws {
+    let fixture = try Fixture()
+    try FileManager.default.createDirectory(at: fixture.cache.appendingPathComponent(name).deletingLastPathComponent(), withIntermediateDirectories: true)
+    let target = try fixture.file(name, "persistent fixture")
+    let engine = fixture.engine()
+    let plan = try await scan(engine)
+    #expect(plan.scanComplete)
+    #expect(plan.scanIssues.isEmpty)
+    let item = try #require(plan.items.first { $0.path == target.path })
+    #expect(item.selection == .optional)
+    #expect(item.blockedReason == nil)
+    #expect(item.impact.contains("登录"))
+    #expect(item.impact.contains("丢失"))
+    #expect(try String(contentsOf: target, encoding: .utf8) == "persistent fixture")
+    let result = try await apply(engine, plan, [item.itemID])
+    #expect(result.status == .completed)
+    #expect(result.items.first?.outcome == .trashed)
+    let destination = URL(fileURLWithPath: try #require(result.items.first?.trashPath))
+    #expect(try String(contentsOf: destination, encoding: .utf8) == "persistent fixture")
+}
+
+@Test func uninstallMovesOnlySelectedDatabaseFilesAndKeepsUnselectedCompanions() async throws {
+    let fixture = try Fixture()
+    let database = try fixture.file("Cache.db", "SQLite format 3\0fixture database")
+    let wal = try fixture.file("Cache.db-wal", "unselected wal")
+    let shm = try fixture.file("Cache.db-shm", "unselected shm")
+    let engine = fixture.engine()
+    let events = EventBox()
+    _ = try await engine.handle(command: "plan-uninstall", request: MaintenanceRequest(appPath: fixture.app.path, expectedBundleID: fixture.bundleID), emit: { events.append($0) })
+    let plan = try #require(events.events.last?.plan)
+    #expect(plan.scanComplete)
+    #expect(plan.scanIssues.isEmpty)
+    #expect(plan.items.count == 4)
+    let body = try #require(plan.items.first { $0.kind == .application })
+    let files = plan.items.filter { $0.kind == .file }
+    #expect(Set(files.map(\.path)) == Set([database.path, wal.path, shm.path]))
+    #expect(files.allSatisfy { $0.selection == .optional && $0.dependsOnItemIDs == [body.itemID] })
+    let selected = try #require(files.first { $0.path == database.path })
+    let result = try await apply(engine, plan, [body.itemID, selected.itemID])
+    #expect(result.status == .completed)
+    #expect(Set(result.items.map(\.path)) == Set([fixture.app.path, database.path]))
+    #expect(result.items.allSatisfy { $0.outcome == .trashed })
+    #expect(!FileManager.default.fileExists(atPath: fixture.app.path))
+    #expect(!FileManager.default.fileExists(atPath: database.path))
+    #expect(try String(contentsOf: wal, encoding: .utf8) == "unselected wal")
+    #expect(try String(contentsOf: shm, encoding: .utf8) == "unselected shm")
+}
+
+@Test func sqliteHeaderInLogWithoutDatabaseExtensionIsOptional() async throws {
+    let fixture = try Fixture()
+    let root = fixture.home.appendingPathComponent("Library/Logs/" + fixture.bundleID)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let target = root.appendingPathComponent("state.dat")
+    try Data("SQLite format 3\0fixture".utf8).write(to: target)
+    let engine = fixture.engine()
+    let plan = try await scan(engine)
+    #expect(plan.scanComplete)
+    #expect(plan.scanIssues.isEmpty)
+    let item = try #require(plan.items.first { $0.path == target.path })
+    #expect(item.selection == .optional)
+    #expect(item.impact.contains("登录"))
+    #expect(try await apply(engine, plan, [item.itemID]).status == .completed)
+    #expect(!FileManager.default.fileExists(atPath: target.path))
+}
+
+@Test func optionalDatabaseStillHonorsNewLongTermProtection() async throws {
+    let fixture = try Fixture()
+    let target = try fixture.file("Cache.db", "keep protected")
+    let engine = fixture.engine()
+    let plan = try await scan(engine)
+    let item = try #require(plan.items.first { $0.path == target.path })
+    _ = try await engine.handle(command: "protect-path", request: MaintenanceRequest(protectedPath: target.path), emit: { _ in })
+    let result = try await apply(engine, plan, [item.itemID])
+    #expect(result.status == .blocked)
+    #expect(try String(contentsOf: target, encoding: .utf8) == "keep protected")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+    let refreshed = try await scan(engine)
+    #expect(refreshed.items.isEmpty)
+    #expect(refreshed.scanIssues.contains { $0.path == fixture.cache.path && $0.reason.contains("长期保护") })
+}
+
+@Test func optionalDatabaseChangedAfterScanIsRetained() async throws {
+    let fixture = try Fixture()
+    let target = try fixture.file("Cache.db", "initial")
+    let engine = fixture.engine()
+    let plan = try await scan(engine)
+    let item = try #require(plan.items.first { $0.path == target.path })
+    try Data("changed after scan".utf8).write(to: target)
+    let result = try await apply(engine, plan, [item.itemID])
+    #expect(result.status == .failed)
+    #expect(result.items.first?.outcome == .failed)
+    #expect(try String(contentsOf: target, encoding: .utf8) == "changed after scan")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.trash.path).isEmpty)
+}
+
 @Test func scanProgressDescribesEachApplicationAndFinalVerificationBeforeReturningPlan() async throws {
     let fixture = try Fixture()
     let target = try fixture.file("A.cache", "keep")
@@ -128,7 +224,8 @@ private func apply(_ engine: MaintenanceEngine, _ plan: MaintenancePlan, _ ids: 
     let sym = fixture.cache.appendingPathComponent("linked.cache")
     try FileManager.default.createSymbolicLink(at: sym, withDestinationURL: db)
     let plan = try await scan(fixture.engine())
-    #expect(plan.items.isEmpty)
+    #expect(plan.items.map(\.path) == [db.path])
+    #expect(plan.items.first?.selection == .optional)
     #expect(plan.scanIssues.count >= 3)
     #expect(FileManager.default.fileExists(atPath: db.path))
 }

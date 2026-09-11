@@ -20,6 +20,7 @@
 - 多版本普通应用按所选路径生成本体移除计划；同 Bundle ID 的共享缓存和日志保留。Xcode 仅支持本体移除，开发数据保留，其他 Apple 应用仍受保护。应用包只读快照接受当前用户或 root 属主，组写仅兼容 root:wheel；完整核验全部位于包内的硬链接，体积按 inode 去重。普通缓存/日志仍限当前用户且无硬链接。快照以紧凑数组保存全部身份字段（含属组），仍受 32 MiB 上限约束。身份、安装集合、运行状态、权限、链接和同卷核验仍生效；普通处理不提权，权限受限本体仅走下述明确确认的系统通道。
 - 应用本体先预检系统 DELETE + ADD_SUBDIRECTORY 权限；无链接父目录 FD 与具体包名核验，普通项继续同卷私有暂存、排他移动。用户已授权扩展系统移除：仅 EACCES 且其他身份、保护、运行状态和完整快照均通过的本体标记「需要系统授权」并允许勾选；确认后以固定 Finder 废纸篓命令处理。生成引用前从持有 FD 读取不透明资源标识，直接复核 CF 文件引用的资源标识和 inode；不使用路径 alias、不拼接 shell，FD 保留至回执。完整复核返回位置与对象后才处理已选缓存/日志；取消或拒绝且源完整则保留，超时/缺少回执/身份变化记待核对，不自动重试。应用及 Bridge 不以 root 运行、不改应用权限、不收集密码；仅此确认操作可能请求 Finder 自动化及系统移除授权。缓存、日志和受保护项目不走系统授权，其他拒绝原因继续锁定。
 - 操作记录覆盖应用列表/单项刷新、磁盘读取、清理与移除计划检查、实际移除；记录结束时间、类型、目标和结果，失败/取消亦记录。启动检测、缓存恢复、搜索/选中和历史刷新不记。页面快照为 `~/Library/Application Support/TidyNest/operation-history.json`，有界私有原子保存；旧引擎执行结果按 runID 导入去重，过去未记录的查询不补录。单条删除与清空均确认精确 ID 集合，执行记录删除标记防止重开/刷新再导入；只清页面，不删引擎审计、防重放凭据或实际文件。损坏文件不覆盖，当前会话结果保留并显示存储错误。应用、磁盘与操作记录详情使用稳定分栏宿主，避免选择引起宽度跳动。
+- 缓存/日志范围内的数据库（含 SQLite 文件头、`.db`、`-wal`、`-shm`）及会话、Cookie、凭据等内容性风险改为可选文件，默认不勾选，由用户判断后明确确认。详情与确认清单说明可能退出登录、丢失本地状态或出现应用异常，并提示核对数据库配套文件；未选文件保留。Documents、Application Support、Preferences 等目录未扩展；编译模型、长期保护、白名单、归属、占用、身份、权限、链接与同卷校验继续生效。当前规则版本为 `mole-1.53.0-subset-5`，旧计划须重新检查。
 - M2 已实现：固定 Mole 1.53.0 的规则移植子集，支持计划预览、明确确认、逐项移入废纸篓、取消、本地记录与长期保护。验收结果及未测边界见 `docs/m2-plan.md`。
 - 完整设计见 `docs/design.md`，M1 验收见 `docs/m1-plan.md`，当前实现计划见 `docs/m2-plan.md`。
 - macOS 14+、Swift 6、Swift Package Manager；不引入外部包依赖。
@@ -39,7 +40,7 @@
 - `MoleInstaller`：固定官方源码与对应架构辅助程序的 SHA-256，完整校验后提取运行白名单，不执行上游安装脚本。使用私有暂存目录、安装锁和同卷排他发布；失败只清理本次暂存目录，已有版本不覆盖。
 - `Sources/TidyNest`：原生界面及界面状态；不能绕过 Core 执行任意命令。
 - `Sources/TidyNestProtocol`：App 与独立引擎共享的结构化协议。
-- `ContainerOwnership`：有界、无链接读取 Containers 直属元数据，以完整 `MCMMetadataIdentifier` 确认归属；枚举前后的全部正/负匹配证据都要复验，容器与文件路径不由显示名或 UUID 推测。应用安装仍须唯一，当前规则版本为 `mole-1.53.0-subset-4`。
+- `ContainerOwnership`：有界、无链接读取 Containers 直属元数据，以完整 `MCMMetadataIdentifier` 确认归属；枚举前后的全部正/负匹配证据都要复验，容器与文件路径不由显示名或 UUID 推测。应用安装仍须唯一，当前规则版本为 `mole-1.53.0-subset-5`。
 - `FinderTrashService`：仅为已确认的权限受限应用本体发送固定 Finder Apple Event，使用公开 CF 文件身份与资源标识核验、600 秒回执等待；不使用脚本字符串路径拼接、sudo 或常驻服务。缺失/未知回执保留待核对结果，系统交互期间取消仅停止后续项并等待当前系统结果。
 - `Sources/TidyNestEngine` / `Sources/TidyNestBridge`：固定规则、计划存储、同卷隔离移动、系统 Trash 与本地记录；不调用原版清理/卸载，不接受任意计划文件。
 - `Sources/TidyNestEngine/Resources/MoleUpstream`：固定 1.53.0 的来源、GPL 许可和审计材料；不执行原始 shell 摘录。
@@ -50,7 +51,7 @@
 
 ## 验证
 
-- 全部测试：`rtk proxy swift test --no-parallel`，当前默认实际执行 305 项（24 项原查询＋6 项列表缓存＋13 项单应用读取＋8 项安装＋29 项桥接＋10 项运行状态＋19 项操作记录存储＋95 项引擎＋101 项界面状态）。显式关闭测试并行，避免本机高负载触发现有脚本 fixture 的 3 秒启动窗口；不放宽生产超时或测试断言。另有 2 项系统废纸篓验证及 1 项联网安装验证默认跳过，需显式启用。
+- 全部测试：`rtk proxy swift test --no-parallel`，当前默认实际执行 310 项（24 项原查询＋6 项列表缓存＋13 项单应用读取＋8 项安装＋29 项桥接＋10 项运行状态＋19 项操作记录存储＋100 项引擎＋101 项界面状态）。显式关闭测试并行，避免本机高负载触发现有脚本 fixture 的 3 秒启动窗口；不放宽生产超时或测试断言。另有 2 项系统废纸篓验证及 1 项联网安装验证默认跳过，需显式启用。
 - 本地 App：`rtk proxy bash scripts/build-app.sh`，输出 `build/TidyNest.app`。
 - 联网安装验收：`rtk proxy env TIDYNEST_VERIFY_MOLE_INSTALL=1 swift test --filter officialMoleInstallsAndRunsFromPublishedDirectory`。只在项目 `work/` 新建目录安装，并从最终目录检测版本、查询新建空目录；默认测试不联网。
 - 必须区分编译检查、自动化测试和真实界面验证，不把未测项说成通过。
@@ -61,6 +62,8 @@
 - 提交仅在需要时进行；先查 status/diff，只暂存相关文件。格式为 `[ai] <type>(<scope>): <中文说明>`。
 
 ## 本地使用与已验证范围
+
+- 2026-09-11 可选数据库与会话文件：用户明确要求由使用者决定是否移除，默认不勾选。缓存/日志内原先因数据库扩展名、SQLite 文件头或会话等内容风险保留的普通文件进入可选清单，详情和最终确认显示登录/本地状态丢失及数据库配套文件说明。仅改规则与影响文案，沿用现有勾选/确认；编译模型、长期保护、白名单、归属、占用、身份、权限、链接及同卷校验不变，版本 subset-5，旧计划须重新检查。新增 5 项引擎回归（含 12 种路径参数）先红后绿；定向运行中一条新测试对长期保护提示层级的错误假设经保存计划定位后修正，生产保护未改。默认 310 项通过（101 XCTest＋212 Swift Testing 中 3 项 opt-in 跳过），只读代码审查无可行动问题。隔离原生真实引擎计划显示应用本体＋三份数据库、文件默认不选，单独勾选数据库后确认清单只有本体和该文件，风险文字可完整滚动查看；取消本体清除依赖，清理扫描三文件均未选且不可确认，样本内容全部保留。临时验收程序曾因误读引擎返回值崩溃，已改为从事件接收计划并完成验证，未修改正式代码以适配验收。release、安装后严格签名和二进制摘要核对通过，已备份更新 /Applications/TidyNest.app；正式启动恢复 72 项，新 Bridge capabilities 确认 subset-5。应用缓存、页面记录、引擎 History/Consumed/Journals 内容和时间均不变，未确认或执行真实移除。日志 work/optional-state-files-red.log、work/optional-state-files-full.log、work/optional-state-files-build.log；原生证据 work/optional-state-files-native-result.json，备份见 work/optional-state-files-install.json。真实 ZCode 新计划及 macOS 14 未实机验证。
 
 - 2026-09-10 应用移除后列表同步：真实记录确认「云·绝区零」15:08 已由 Finder 移除，旧列表和缓存仍残留。仅在执行收尾后同步已确认本体结果，按精确路径更新内存和缓存，清失效详情、保留搜索与完整列表时间；引擎不变。新增 8 项回归，初始 7 项中 4 项先复现失败；审查补齐真实 Bridge 中断返回 unknown 且保留逐项结果的链路，复核无剩余问题。最终默认 305 项通过（101 XCTest＋207 Swift Testing 中 3 项 opt-in 跳过）。隔离原生窗口注入成功结果后返回应用页，2→1、详情清空、搜索保留、更新时间不变，分隔位置保持 507，缓存仅剩 B。release、安装后严格签名与摘要通过，已备份更新 /Applications/TidyNest.app，Bridge 二进制不变。通过正式刷新清除旧版残留后重开，搜索「云·绝区零」为 0 项；完整列表仍 72 项，本次刷新新增当前已安装的 Rebased。重开后缓存内容/时间、整个验证期间引擎 History/Consumed/Journals 均不变，未执行新的真实移除。证据 work/removal-sync-native-result.json，日志 work/removal-sync-red.log、work/removal-sync-full-final.log、work/removal-sync-build.log，备份见 work/removal-sync-install.json。macOS 14 未实机验证。
 

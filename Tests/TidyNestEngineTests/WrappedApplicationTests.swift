@@ -216,7 +216,7 @@ func wrappedContainerOwnershipIsRecheckedAfterBodyAndStaging(_ afterStaging: Boo
     #expect(try String(contentsOf: cache, encoding: .utf8) == "fixture data")
 }
 
-@Test func wrappedContainerUnsafeAndPersistentFilesNeverEnterPlan() async throws {
+@Test func wrappedContainerUnsafeFilesStayAndDatabaseIsOptional() async throws {
     let fixture = try WrapperFixture()
     let container = try fixture.container()
     let safe = try fixture.file("Data/Library/Caches/safe.cache", under: container)
@@ -230,7 +230,10 @@ func wrappedContainerOwnershipIsRecheckedAfterBodyAndStaging(_ afterStaging: Boo
     let engine = MaintenanceEngine(context: fixture.context())
     let plan = try await fixture.plan(engine, uninstall: false)
     #expect(plan.scanComplete)
-    #expect(plan.items.map(\.path) == [safe.path])
+    #expect(Set(plan.items.map(\.path)) == Set([safe.path, database.path]))
+    let databaseItem = try #require(plan.items.first { $0.path == database.path })
+    #expect(databaseItem.selection == .optional)
+    #expect(databaseItem.impact.contains("登录"))
     #expect(try await fixture.apply(engine, plan: plan, paths: [safe.path]).status == .completed)
     for url in [database, model, original, hard, sym] { #expect(FileManager.default.fileExists(atPath: url.path)) }
 }

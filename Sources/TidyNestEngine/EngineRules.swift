@@ -156,7 +156,7 @@ private func applicationMetadata(at path: String) throws -> ApplicationMetadata 
 func validBundle(_ value: String) -> Bool { value.range(of: #"^[A-Za-z0-9][-A-Za-z0-9]*(\.[A-Za-z0-9][-A-Za-z0-9]*)+$"#, options: .regularExpression) != nil }
 
 struct EngineRules: Sendable {
-    static let version = "mole-1.53.0-subset-4"
+    static let version = "mole-1.53.0-subset-5"
     static let engineVersion = "2.0.0"
     static let xcodeBundleID = "com.apple.dt.xcode"
     static let ids = ["mole.user-cache.exact-file.v1", "mole.user-log.exact-file.v1", "mole.application.bundle.v1", "tidynest.container-cache.exact-file.v1", "tidynest.container-log.exact-file.v1"]
@@ -245,10 +245,19 @@ struct EngineRules: Sendable {
             if ancestors.contains(where: { matches($0, pattern) }) { return "Mole 白名单或硬安全保护。" }
         }
         let lower = path.lowercased()
-        let forbidden = [".sqlite", ".sqlite3", ".db", "-wal", "-shm", ".mlmodel", ".mlmodelc", ".mlpackage", ".e5bundle", "com.apple.e5rt.e5bundlecache", "keychain", "credential", "session", "cookies", "preferences", "local storage", "indexeddb"]
-        if forbidden.contains(where: { lower.contains($0) }) { return "数据库、编译模型或敏感持久状态保护。" }
+        let forbidden = [".mlmodel", ".mlmodelc", ".mlpackage", ".e5bundle", "com.apple.e5rt.e5bundlecache"]
+        if forbidden.contains(where: { lower.contains($0) }) { return "编译模型保护。" }
         if URL(fileURLWithPath: path).lastPathComponent == ".DS_Store" { return "Finder 元数据保护。" }
         return nil
+    }
+    func fileImpact(_ path: String, isSQLite: Bool) -> String {
+        // 内容风险交由用户判断；路径范围、归属、占用和长期保护仍独立核验。
+        let lower = path.lowercased()
+        let persistent = [".sqlite", ".sqlite3", ".db", "-wal", "-shm", "keychain", "credential", "session", "cookies", "preferences", "local storage", "indexeddb"]
+        if isSQLite || persistent.contains(where: { lower.contains($0) }) {
+            return "数据库或会话等持久状态文件，可能包含登录信息或本地数据。移入废纸篓可能导致退出登录、状态丢失或应用异常；默认不勾选，请自行判断，并一并核对相关数据库配套文件。"
+        }
+        return "移入废纸篓；缓存可能重新生成，日志移走后历史排错记录不可直接读取。"
     }
 }
 struct Configuration: Sendable {
