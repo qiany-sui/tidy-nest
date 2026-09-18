@@ -42,7 +42,7 @@ struct EngineContext: Sendable {
         return Self(home: home, appRoots: ["/Applications", home + "/Applications"], catalog: {
             let service = MoleService()
             let installation = try await service.detect()
-            guard installation.version == "1.53.0" else { throw EngineFailure("维护规则仅支持 Mole 1.53.0。") }
+            guard installation.isSupported else { throw MoleError.unsupportedVersion(installation.version) }
             let applications = try await service.applications(using: installation)
             var catalog = try applications.map { try catalogApplication(at: $0.path, name: $0.name, source: $0.source, observedBundleID: $0.bundleIdentifier) }
             // 核验范围沿用固定 Mole 的安装目录与挂载卷，避免额外触发桌面/下载隐私权限请求。

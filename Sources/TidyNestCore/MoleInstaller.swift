@@ -99,7 +99,7 @@ public struct MoleInstaller: Sendable {
             try Task.checkCancellation()
             onProgress(.checking)
             let verified = try await MoleService(candidates: [payload.appendingPathComponent("mole")]).detect()
-            guard verified.isSupported else { throw MoleInstallError.invalidPackage }
+            guard verified.version == Self.version else { throw MoleInstallError.invalidPackage }
             // 下载期间外部可能完成了安装；优先复用它，不发布第二份或覆盖已有版本。
             if let existing = try await existingInstallation() { return existing }
             try Task.checkCancellation()

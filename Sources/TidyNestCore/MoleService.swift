@@ -59,6 +59,6 @@ public struct MoleService: Sendable {
         // 检测结果可能在外部升级后过期；每次查询前重新核对实际可执行文件。
         let output = try await runner.run(executableURL: installation.executableURL, arguments: ["--version"], timeout: 10)
         let actualVersion = try MoleParser.version(output.stdout)
-        guard actualVersion == "1.53.0" else { throw MoleError.unsupportedVersion(actualVersion) }
+        guard MoleInstallation.supportedVersions.contains(actualVersion) else { throw MoleError.unsupportedVersion(actualVersion) }
     }
 }

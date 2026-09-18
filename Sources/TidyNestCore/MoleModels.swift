@@ -3,7 +3,8 @@ import Foundation
 public struct MoleInstallation: Sendable, Equatable {
     public let executableURL: URL
     public let version: String
-    public var isSupported: Bool { version == "1.53.0" }
+    public static let supportedVersions = ["1.53.0", "1.54.0"]
+    public var isSupported: Bool { Self.supportedVersions.contains(version) }
 
     public init(executableURL: URL, version: String) {
         self.executableURL = executableURL
@@ -93,7 +94,7 @@ public enum MoleError: Error, LocalizedError, Sendable {
         switch self {
         case .notInstalled: "未找到 Mole。请确认已在本机安装。"
         case .invalidVersion: "无法识别 Mole 版本，请检查本机安装。"
-        case .unsupportedVersion(let version): "当前 Mole 版本 \(Self.safeDiagnostic(version)) 尚未验证，暂时无法查询。已验证版本为 1.53.0。"
+        case .unsupportedVersion(let version): "当前 Mole 版本 \(Self.safeDiagnostic(version)) 尚未验证，暂时无法查询。已验证版本为 \(MoleInstallation.supportedVersions.joined(separator: "、"))。"
         case .invalidDirectory: "请选择一个存在的本地目录。"
         case .invalidExecutable: "Mole 路径不在已知安装位置，请重新检测。"
         case .invalidResponse(let context): "Mole 返回的\(context)格式不正确，无法显示结果。"

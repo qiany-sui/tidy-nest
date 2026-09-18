@@ -1,4 +1,5 @@
 import SwiftUI
+import TidyNestCore
 
 struct SettingsView: View {
     @Bindable var model: WorkspaceModel
@@ -40,7 +41,7 @@ struct SettingsView: View {
                 if case .failed(let message) = model.connectionPhase, !model.showsMoleInstallation {
                     Text(message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                 }
-                Text("应用列表与磁盘查询使用 Mole 1.53.0。清理计划与逐项移入废纸篓由随包维护引擎处理。")
+                Text("应用列表与磁盘查询支持 Mole \(MoleInstallation.supportedVersions.joined(separator: "、"))。清理计划与逐项移入废纸篓由随包维护引擎处理。")
                     .font(.caption).foregroundStyle(.secondary)
                 Divider()
                 HStack {

@@ -154,10 +154,11 @@ struct MoleCoreTests {
         } catch { Issue.record("错误类型不正确") }
     }
 
-    @Test func serviceDetectsAndUsesOnlyReadOnlyQueries() async throws {
+    @Test(arguments: ["1.53.0", "1.54.0"])
+    func serviceDetectsAndUsesOnlyReadOnlyQueries(version: String) async throws {
         let fixture = try ScriptFixture(#"""
         if [ "$#" = 1 ] && [ "$1" = --version ]; then
-          printf 'Mole version 1.53.0\n'
+          printf 'Mole version %s\n' "$(/bin/cat "${0}.version")"
         elif [ "$#" = 2 ] && [ "$1" = uninstall ] && [ "$2" = --list ]; then
           printf '[{"name":"Example","bundle_id":"com.example","source":"App","uninstall_name":"Example","path":"/Applications/Example.app","size":"N/A"}]'
         elif [ "$#" = 3 ] && [ "$1" = analyze ] && [ "$2" = --json ]; then
@@ -168,6 +169,7 @@ struct MoleCoreTests {
         fi
         """#)
         defer { fixture.remove() }
+        try Data(version.utf8).write(to: URL(fileURLWithPath: fixture.script.path + ".version"))
         let service = MoleService(candidates: [URL(fileURLWithPath: "/does/not/exist"), fixture.script])
         let installation = try await service.detect()
         #expect(installation.isSupported)
@@ -241,7 +243,7 @@ struct MoleCoreTests {
         try Data("Mole version 1.53.0\n".utf8).write(to: versionFile)
         let service = MoleService(candidates: [fixture.script])
         let installation = try await service.detect()
-        try Data("Mole version 1.54.0\n".utf8).write(to: versionFile)
+        try Data("Mole version 1.55.0\n".utf8).write(to: versionFile)
         do {
             _ = try await service.applications(using: installation)
             Issue.record("检测后版本变化应阻止查询")
@@ -251,14 +253,35 @@ struct MoleCoreTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.script.path + ".queried"))
     }
 
+    @Test func queryAcceptsUpgradeToAnotherVerifiedVersion() async throws {
+        let fixture = try ScriptFixture(#"""
+        if [ "$1" = --version ]; then
+          /bin/cat "${0}.version"
+        elif [ "$#" = 2 ] && [ "$1" = uninstall ] && [ "$2" = --list ]; then
+          printf '[{"name":"After upgrade","bundle_id":"com.example","source":"App","uninstall_name":"Example","path":"/Applications/Example.app","size":"N/A"}]'
+        else
+          exit 99
+        fi
+        """#)
+        defer { fixture.remove() }
+        let versionFile = URL(fileURLWithPath: fixture.script.path + ".version")
+        try Data("Mole version 1.53.0\n".utf8).write(to: versionFile)
+        let service = MoleService(candidates: [fixture.script])
+        let installation = try await service.detect()
+        try Data("Mole version 1.54.0\n".utf8).write(to: versionFile)
+        let apps = try await service.applications(using: installation)
+        #expect(apps.first?.name == "After upgrade")
+    }
+
     @Test func detectMissingInstallationIsActionable() async {
         do { _ = try await MoleService(candidates: [URL(fileURLWithPath: "/does/not/exist")]).detect(); Issue.record("应报告未安装") }
         catch let error as MoleError { guard case .notInstalled = error else { Issue.record("错误类型不正确"); return } }
         catch { Issue.record("错误类型不正确") }
     }
 
-    @Test func unsupportedVersionPreventsExecution() async throws {
-        let installation = MoleInstallation(executableURL: URL(fileURLWithPath: "/does/not/exist"), version: "1.54.0")
+    @Test(arguments: ["1.52.0", "1.53.1", "1.54.1", "1.55.0", "2.0.0", "1.54.0-beta"])
+    func unsupportedVersionPreventsExecution(version: String) async throws {
+        let installation = MoleInstallation(executableURL: URL(fileURLWithPath: "/does/not/exist"), version: version)
         do { _ = try await MoleService().applications(using: installation); Issue.record("未知版本应拒绝查询") }
         catch let error as MoleError { guard case .unsupportedVersion = error else { Issue.record("应在启动进程前拒绝未知版本"); return } }
     }
