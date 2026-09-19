@@ -99,8 +99,9 @@ final class MaintenanceModel {
     var selectedBytes: UInt64 { selectedItems.compactMap(\.estimatedBytes).reduce(0, +) }
     var unknownSizeCount: Int { selectedItems.filter { $0.estimatedBytes == nil }.count }
     var focusedItem: MaintenanceItem? { plan?.items.first { $0.itemID == focusedItemID } }
+    var normalizedSearchText: String { searchText.trimmingCharacters(in: .whitespacesAndNewlines) }
     var filteredItems: [MaintenanceItem] {
-        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let search = normalizedSearchText
         return (plan?.items ?? []).filter {
             search.isEmpty || $0.displayName.localizedCaseInsensitiveContains(search) || $0.path.localizedCaseInsensitiveContains(search)
         }
@@ -132,6 +133,10 @@ final class MaintenanceModel {
                 selectedItemIDs.subtract(invalid)
             }
         }
+    }
+
+    func setFilteredItemsSelected(_ selected: Bool) {
+        for item in filteredItems { setSelected(item.itemID, selected: selected) }
     }
 
     func scanClean() { startPlan(application: nil) }

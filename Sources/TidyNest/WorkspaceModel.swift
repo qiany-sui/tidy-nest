@@ -231,14 +231,8 @@ final class WorkspaceModel {
                 }
                 applicationsPhase = .loaded
                 operationHistory.record(activity.finished(.completed, summary: "已读取 \(result.count) 个应用。"))
-                let updatedAt = Date()
-                applicationsUpdatedAt = updatedAt
-                applicationCacheNotice = nil
-                do {
-                    try applicationCache?.save(ApplicationListSnapshot(applications: result, updatedAt: updatedAt))
-                } catch {
-                    applicationCacheNotice = "列表已更新，但未能保存；下次打开仍需重新读取。"
-                }
+                applicationsUpdatedAt = Date()
+                persistApplicationSnapshot(failureNotice: "列表已更新，但未能保存；下次打开仍需重新读取。")
             } catch {
                 guard operationID == id else { return }
                 applicationsPhase = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
@@ -259,14 +253,17 @@ final class WorkspaceModel {
             self.applicationRefreshTarget = nil
             applicationRefreshPhase = .idle
         }
+        persistApplicationSnapshot(failureNotice: "应用已移除，但列表未能保存；下次打开请刷新列表。")
+    }
+
+    private func persistApplicationSnapshot(failureNotice: String) {
         applicationCacheNotice = nil
+        // 单项刷新和移除同步沿用完整列表时间；只有全量读取成功才更新该时间。
+        guard let updatedAt = applicationsUpdatedAt else { return }
         do {
-            // 同步已确认的移除结果，不冒充一次完整列表刷新，也不重新扫描其他应用。
-            if let updatedAt = applicationsUpdatedAt {
-                try applicationCache?.save(ApplicationListSnapshot(applications: applications, updatedAt: updatedAt))
-            }
+            try applicationCache?.save(ApplicationListSnapshot(applications: applications, updatedAt: updatedAt))
         } catch {
-            applicationCacheNotice = "应用已移除，但列表未能保存；下次打开请刷新列表。"
+            applicationCacheNotice = failureNotice
         }
     }
 
@@ -297,15 +294,7 @@ final class WorkspaceModel {
                 applications[index] = result
                 applicationRefreshPhase = .loaded
                 operationHistory.record(activity.finished(.completed, summary: "已更新名称、Bundle ID 与占用信息（\(result.displaySize)）。"))
-                applicationCacheNotice = nil
-                do {
-                    // 单项刷新只更新此记录，保留完整列表更新时间。
-                    if let updatedAt = applicationsUpdatedAt {
-                        try applicationCache?.save(ApplicationListSnapshot(applications: applications, updatedAt: updatedAt))
-                    }
-                } catch {
-                    applicationCacheNotice = "应用已刷新，但未能保存；下次打开仍需重新读取。"
-                }
+                persistApplicationSnapshot(failureNotice: "应用已刷新，但未能保存；下次打开仍需重新读取。")
             } catch {
                 guard operationID == id else { return }
                 applicationRefreshPhase = error is CancellationError ? .cancelled : .failed(error.localizedDescription)

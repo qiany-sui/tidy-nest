@@ -317,6 +317,36 @@ final class SingleApplicationRefreshTests: XCTestCase {
         XCTAssertTrue(model.canPlanUninstall(first))
     }
 
+    func testSingleRefreshCacheFailureKeepsResultAndSuccessfulRetryClearsNotice() async throws {
+        let first = singleApplication("First", path: "/fixture/first.app")
+        let second = singleApplication("Second", path: "/fixture/second.app")
+        let updated = singleApplication("Updated", path: first.path)
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let cacheURL = root.appendingPathComponent("work/single-application-refresh-tests/\(UUID().uuidString)/applications.json")
+        let cache = ApplicationListCache(fileURL: cacheURL)
+        try cache.save(ApplicationListSnapshot(applications: [first, second], updatedAt: singleSnapshotDate))
+        let model = singleRefreshWorkspace(cache: cache, refresh: { _ in updated })
+        model.start()
+        await settle(model)
+        let backupURL = cacheURL.appendingPathExtension("backup")
+        try FileManager.default.moveItem(at: cacheURL, to: backupURL)
+        try FileManager.default.createDirectory(at: cacheURL, withIntermediateDirectories: false)
+        model.refreshApplication(first)
+        await settle(model)
+        XCTAssertEqual(model.applicationRefreshPhase, .loaded)
+        XCTAssertEqual(model.applications, [updated, second])
+        XCTAssertEqual(model.applicationsUpdatedAt, singleSnapshotDate)
+        XCTAssertEqual(model.applicationCacheNotice, "应用已刷新，但未能保存；下次打开仍需重新读取。")
+        XCTAssertEqual(model.operationHistory.records.first?.status, .completed)
+        XCTAssertEqual(ApplicationListCache(fileURL: backupURL).load()?.applications, [first, second])
+
+        try FileManager.default.moveItem(at: cacheURL, to: cacheURL.appendingPathExtension("blocked-directory"))
+        model.refreshApplication(updated)
+        await settle(model)
+        XCTAssertNil(model.applicationCacheNotice)
+        XCTAssertEqual(cache.load(), ApplicationListSnapshot(applications: [updated, second], updatedAt: singleSnapshotDate))
+    }
+
     private func settle(_ model: WorkspaceModel) async {
         for _ in 0..<2_000 {
             if !model.isBusy { return }

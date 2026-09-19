@@ -207,21 +207,22 @@ struct MaintenanceView: View {
     }
 
     private var planList: some View {
-        VStack(spacing: 0) {
+        let isSearching = !maintenance.normalizedSearchText.isEmpty
+        return VStack(spacing: 0) {
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("搜索名称或路径", text: Binding(get: { maintenance.searchText }, set: { maintenance.searchText = $0 }))
                     .textFieldStyle(.plain)
             }.padding(10).background(NestStyle.subtle, in: RoundedRectangle(cornerRadius: 8)).padding(16)
             HStack {
-                Button("选择当前可选项目") {
-                    for item in maintenance.filteredItems { maintenance.setSelected(item.itemID, selected: true) }
+                Button(isSearching ? "全选搜索结果" : "全选") {
+                    maintenance.setFilteredItemsSelected(true)
                 }
-                Button("取消当前选择") {
-                    for item in maintenance.filteredItems { maintenance.setSelected(item.itemID, selected: false) }
+                Button(isSearching ? "取消搜索结果选择" : "取消全选") {
+                    maintenance.setFilteredItemsSelected(false)
                 }
                 Spacer()
-            }.font(.caption).buttonStyle(.borderless).padding(.horizontal, 18).padding(.bottom, 10)
+            }.font(.callout).buttonStyle(.bordered).controlSize(.regular).padding(.horizontal, 18).padding(.bottom, 10)
                 .disabled(!maintenance.canStart || maintenance.planExpired)
             List(selection: Binding(get: { maintenance.focusedItemID }, set: { maintenance.focusedItemID = $0 })) {
                 ForEach(PlanGroup.allCases) { group in

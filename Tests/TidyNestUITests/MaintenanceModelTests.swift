@@ -6,6 +6,103 @@ import TidyNestProtocol
 
 @MainActor
 final class MaintenanceModelTests: XCTestCase {
+    func testBulkSelectionSkipsProtectedItemsAndClearsConfirmationOnDeselect() async {
+        let plan = fixturePlan(kind: .uninstall, items: [
+            fixtureItem("app", selection: .required, kind: .application),
+            fixtureItem("cache", dependencies: ["app"]),
+            fixtureItem("log", dependencies: ["app"]),
+            fixtureItem("blocked", selection: .blocked)
+        ])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }, apply: { _, _, _ in
+            XCTFail("批量勾选不能执行移除")
+            throw FixtureError.failed
+        }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.searchText = " \n\t "
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["app", "cache", "log"])
+        model.requestConfirmation()
+        XCTAssertEqual(Set(model.confirmation?.itemIDs ?? []), ["app", "cache", "log"])
+        model.setFilteredItemsSelected(false)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        XCTAssertNil(model.confirmation)
+        XCTAssertFalse(model.canConfirm)
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["app", "cache", "log"])
+    }
+
+    func testBulkSelectionUsesTrimmedPathSearchAndKeepsUnmatchedSelections() async {
+        let plan = fixturePlan(items: [fixtureItem("cache"), fixtureItem("log")])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.setSelected("log", selected: true)
+        model.searchText = " \n/FIXTURE/cache\t "
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["cache", "log"])
+        model.setFilteredItemsSelected(false)
+        XCTAssertEqual(model.selectedItemIDs, ["log"])
+        model.searchText = "no-match"
+        model.requestConfirmation()
+        let confirmationID = model.confirmation?.id
+        model.setFilteredItemsSelected(true)
+        model.setFilteredItemsSelected(false)
+        XCTAssertEqual(model.selectedItemIDs, ["log"])
+        XCTAssertEqual(model.confirmation?.id, confirmationID)
+    }
+
+    func testBulkSelectionDoesNotSelectAnUnmatchedDependencyAndDeselectingParentClearsChildren() async {
+        let plan = fixturePlan(kind: .uninstall, items: [
+            fixtureItem("app", selection: .required, kind: .application),
+            fixtureItem("cache", dependencies: ["app"])
+        ])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.setSelected("app", selected: false)
+        model.searchText = "cache"
+        model.setFilteredItemsSelected(true)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        model.searchText = ""
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["app", "cache"])
+        model.searchText = "app"
+        model.setFilteredItemsSelected(false)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty, "取消本体仍同步取消搜索结果外的依赖项")
+    }
+
+    func testBulkSelectionKeepsExistingDependencyOrder() async {
+        let plan = fixturePlan(items: [fixtureItem("child", dependencies: ["parent"]), fixtureItem("parent")])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["parent"], "重构须保留原有按计划顺序逐项选择的行为")
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["parent", "child"])
+    }
+
+    func testBulkSelectionRespectsBusyAndExpiredPlanGuards() async {
+        let model = MaintenanceModel(actions: fixtureActions())
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.setSelected("cache", selected: true)
+        model.requestConfirmation()
+        let confirmationID = model.confirmation?.id
+        model.canStartRequest = { false }
+        model.setFilteredItemsSelected(false)
+        XCTAssertEqual(model.selectedItemIDs, ["cache"])
+        XCTAssertEqual(model.confirmation?.id, confirmationID)
+        model.canStartRequest = { true }
+        model.changeProtection(path: "/fixture/cache", protected: true)
+        await model.waitForCurrentOperation()
+        XCTAssertTrue(model.planExpired)
+        model.setFilteredItemsSelected(true)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        XCTAssertFalse(model.canConfirm)
+    }
+
     func testSystemAuthorizationApplicationCanToggleAndOnlyExecuteAfterConfirmation() async {
         let body = MaintenanceItem(itemID: "authorized-body", ruleID: "mole.application.bundle.v1", path: "/fixture/Authorized.app", displayName: "Authorized", kind: .application, action: .trashItem, estimatedBytes: 20, reason: "应用本体", impact: "移入废纸篓", selection: .required, blockedReason: nil, dependsOnItemIDs: [], requiresAuthorization: true)
         let plan = fixturePlan(kind: .uninstall, items: [body])
