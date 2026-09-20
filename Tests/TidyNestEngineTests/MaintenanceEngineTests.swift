@@ -899,6 +899,100 @@ func systemTrashMovesOnlyNewIsolatedFixture() async throws {
     #expect(FileManager.default.fileExists(atPath: b.path))
 }
 
+@Test(arguments: [false, true], ["updated", "addedDuplicate", "removed"])
+func catalogChangeStopsRemainingBatchAndNamesApplication(_ uninstalling: Bool, _ change: String) async throws {
+    let fixture = try Fixture()
+    let a = try fixture.file("A.cache")
+    let b = try fixture.file("B.cache", "keep B")
+    let c = try fixture.file("C.cache", "keep C")
+    let other = fixture.home.appendingPathComponent("Applications/Other.app")
+    let otherInfo = other.appendingPathComponent("Contents/Info.plist")
+    let otherPlist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.example.other"], format: .xml, options: 0)
+    if change != "addedDuplicate" {
+        try FileManager.default.createDirectory(at: otherInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try otherPlist.write(to: otherInfo)
+    }
+    let events = EventBox()
+    let catalogChecks = EventBox()
+    let base = fixture.context(hook: { boundary, path, _ in
+        guard boundary == .afterTrash, path == a.path else { return }
+        switch change {
+        case "updated":
+            let updated = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.example.other", "CFBundleVersion": "2"], format: .xml, options: 0)
+            try updated.write(to: otherInfo, options: .atomic)
+        case "addedDuplicate":
+            try FileManager.default.createDirectory(at: otherInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let duplicate = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": fixture.bundleID], format: .xml, options: 0)
+            try duplicate.write(to: otherInfo)
+        default:
+            try FileManager.default.moveItem(at: other, to: fixture.root.appendingPathComponent("removed-other.app"))
+        }
+    })
+    let context = EngineContext(home: base.home, appRoots: base.appRoots, catalog: {
+        if let progress = events.events.last(where: { $0.type == .progress }) { catalogChecks.append(progress) }
+        return try [fixture.app, other].filter { FileManager.default.fileExists(atPath: $0.path) }
+            .map { try catalogApplication(at: $0.path, name: $0.lastPathComponent, source: "app") }
+    }, runtime: base.runtime, trash: base.trash, hook: base.hook, environment: base.environment)
+    let engine = MaintenanceEngine(context: context)
+    let plan = try await (uninstalling ? uninstall(engine, fixture: fixture) : scan(engine))
+    #expect(plan.scanComplete)
+    #expect(plan.items.count == (uninstalling ? 4 : 3))
+    _ = try await engine.handle(command: "apply-plan", request: MaintenanceRequest(planID: plan.planID, selectedItemIDs: plan.items.map(\.itemID), confirmed: true), emit: { events.append($0) })
+    let result = try #require(events.events.last?.applyResult)
+    #expect(result.status == .partial)
+    #expect(result.items.map(\.outcome) == (uninstalling ? [.trashed, .trashed, .failed, .skipped] : [.trashed, .failed, .skipped]))
+    #expect(result.items.first { $0.path == b.path }?.reason?.contains(other.path) == true)
+    #expect(result.message?.contains(other.path) == true)
+    #expect(result.message?.contains("已停止") == true)
+    #expect(catalogChecks.events.count == (uninstalling ? 4 : 3))
+    #expect(!FileManager.default.fileExists(atPath: a.path))
+    #expect(try String(contentsOf: b, encoding: .utf8) == "keep B")
+    #expect(try String(contentsOf: c, encoding: .utf8) == "keep C")
+    #expect(result.items.filter { [.failed, .skipped].contains($0.outcome) }.allSatisfy { $0.retainedPath == $0.path && $0.trashPath == nil })
+    let historyData = try #require(try await engine.handle(command: "history", request: MaintenanceRequest(), emit: { _ in }))
+    let history = try MaintenanceJSON.decoder().decode([MaintenanceResult].self, from: historyData)
+    let recorded = try #require(history.first { $0.runID == result.runID })
+    #expect(recorded.items.map(\.outcome) == result.items.map(\.outcome))
+    #expect(recorded.message == result.message)
+}
+
+@Test(arguments: ["catalog", "identity", "cancel"])
+func unavailableCatalogStopsBatchAndPreservesCancellation(_ failure: String) async throws {
+    let fixture = try Fixture()
+    let a = try fixture.file("A.cache")
+    let b = try fixture.file("B.cache", "keep B")
+    let c = try fixture.file("C.cache", "keep C")
+    let changed = MutableFlag()
+    let events = EventBox()
+    let catalogChecks = EventBox()
+    let base = fixture.context(hook: { boundary, path, _ in
+        guard boundary == .afterTrash, path == a.path else { return }
+        changed.set()
+        if failure == "identity" {
+            try FileManager.default.moveItem(at: fixture.app.appendingPathComponent("Contents/Info.plist"), to: fixture.root.appendingPathComponent("moved-info.plist"))
+        }
+    })
+    let context = EngineContext(home: base.home, appRoots: base.appRoots, catalog: {
+        if let progress = events.events.last(where: { $0.type == .progress }) { catalogChecks.append(progress) }
+        if changed.isSet {
+            if failure == "cancel" { throw CancellationError() }
+            if failure == "catalog" { throw EngineFailure("fixture catalog unavailable") }
+        }
+        return try await base.catalog()
+    }, runtime: base.runtime, trash: base.trash, hook: base.hook, environment: base.environment)
+    let engine = MaintenanceEngine(context: context)
+    let plan = try await scan(engine)
+    #expect(plan.scanComplete)
+    _ = try await engine.handle(command: "apply-plan", request: MaintenanceRequest(planID: plan.planID, selectedItemIDs: plan.items.map(\.itemID), confirmed: true), emit: { events.append($0) })
+    let result = try #require(events.events.last?.applyResult)
+    #expect(result.status == .partial)
+    #expect(result.items.map(\.outcome) == (failure == "cancel" ? [.trashed, .cancelled, .cancelled] : [.trashed, .failed, .skipped]))
+    #expect(catalogChecks.events.count == 3)
+    if failure != "cancel" { #expect(result.message?.contains("无法完整复核安装集合") == true) }
+    #expect(try String(contentsOf: b, encoding: .utf8) == "keep B")
+    #expect(try String(contentsOf: c, encoding: .utf8) == "keep C")
+}
+
 @Test func sharedWritableFileIsNotCandidate() async throws {
     let fixture = try Fixture()
     let target = try fixture.file("shared.cache")

@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import TidyNestProtocol
 
-private struct CatalogRecord: Codable, Sendable {
+private struct CatalogRecord: Codable, Equatable, Sendable {
     let app: EngineApplication
     let root: FileIdentity
     let info: FileIdentity?
@@ -129,6 +129,14 @@ public actor MaintenanceEngine {
     }
     private func catalogDigest(_ catalog: [EngineApplication]) throws -> String {
         digest(try MaintenanceJSON.encoder().encode(captureCatalog(catalog)))
+    }
+    private func catalogChangeReason(expected: [CatalogRecord], current: [CatalogRecord]) -> String {
+        let before = Dictionary(grouping: expected, by: { $0.app.path })
+        let after = Dictionary(grouping: current, by: { $0.app.path })
+        let changedPaths = Set(before.keys).union(after.keys).filter { before[$0] != after[$0] }.sorted()
+        let paths = changedPaths.prefix(3).joined(separator: "、")
+        let remainder = changedPaths.count > 3 ? "（另有 \(changedPaths.count - 3) 项）" : ""
+        return "执行期间安装集合或应用身份发生变化，已停止后续处理，未处理项目保留。变化应用：" + paths + remainder + "。请核对已处理结果，重新检查后再操作。"
     }
     private func checkCancelled() throws { if cancellation.isCancelled || Task.isCancelled { throw CancellationError() } }
 
@@ -366,11 +374,14 @@ public actor MaintenanceEngine {
         try journal(store, stream.runID, state: "accepted", accepted: accepted)
         var results: [MaintenanceItemResult] = []
         var cancellationObserved = false
+        var catalogInvalidationReason: String?
         for item in items {
             if cancellation.isCancelled || Task.isCancelled { cancellationObserved = true }
             let result: MaintenanceItemResult
             if cancellationObserved {
                 result = itemResult(item, .cancelled, "已取消后续项目，当前文件保留。", retained: item.path)
+            } else if catalogInvalidationReason != nil {
+                result = itemResult(item, .skipped, "安装集合复核未通过，本次计划已停止；此项未执行，原位置保留。", retained: item.path)
             } else if item.dependsOnItemIDs.contains(where: { id in !results.contains(where: { $0.itemID == id && $0.outcome == .trashed }) }) {
                 result = itemResult(item, .skipped, "应用本体未确定移入废纸篓，相关残留全部保留。", retained: item.path)
             } else {
@@ -380,8 +391,21 @@ public actor MaintenanceEngine {
                     guard currentConfiguration.digest == plan.configurationDigest else { throw EngineFailure("执行期间保护配置发生变化，当前及后续目标保留，请重新扫描。") }
                     let removedBodies = Set(results.filter { result in result.outcome == .trashed && plan.items.contains { $0.itemID == result.itemID && $0.kind == .application } }.map(\.path))
                     let expectedRecords = saved.catalogRecords.filter { !removedBodies.contains($0.app.path) }
-                    let currentRecords = try await captureCatalog(context.catalog())
-                    guard digest(try MaintenanceJSON.encoder().encode(currentRecords)) == digest(try MaintenanceJSON.encoder().encode(expectedRecords)) else { throw EngineFailure("执行期间安装集合或应用身份发生变化，当前目标保留。") }
+                    let currentRecords: [CatalogRecord]
+                    do {
+                        currentRecords = try await captureCatalog(context.catalog())
+                    } catch {
+                        if error is CancellationError { throw error }
+                        let reason = "执行期间无法完整复核安装集合，已停止后续处理，未处理项目保留。" + error.localizedDescription
+                        catalogInvalidationReason = reason
+                        throw EngineFailure(reason)
+                    }
+                    guard digest(try MaintenanceJSON.encoder().encode(currentRecords)) == digest(try MaintenanceJSON.encoder().encode(expectedRecords)) else {
+                        // 整批授权依据已失效，后续只记录保留结果，不重复扫描或尝试移除。
+                        let reason = catalogChangeReason(expected: expectedRecords, current: currentRecords)
+                        catalogInvalidationReason = reason
+                        throw EngineFailure(reason)
+                    }
                     var owner = saved.owners[item.itemID]!
                     if let body = results.first(where: { item.dependsOnItemIDs.contains($0.itemID) && $0.outcome == .trashed }), let trashPath = body.trashPath {
                         owner.originalPath = owner.path
@@ -409,7 +433,7 @@ public actor MaintenanceEngine {
         }
         let successful = results.filter { $0.outcome == .trashed }
         let status: MaintenanceStatus = results.contains(where: { $0.outcome == .unknown }) ? .unknown : (successful.count == items.count ? .completed : (!successful.isEmpty ? .partial : (cancellationObserved ? .cancelled : .failed)))
-        let result = MaintenanceResult(planID: planID, runID: stream.runID, title: plan.title, status: status, startedAt: started, finishedAt: Date(), items: results, selectedBytes: selectedBytes, trashedBytes: successful.reduce(0) { $0 + ($1.estimatedBytes ?? 0) }, freeBytesDelta: nil, message: "移入废纸篓不会立即释放对应空间；未自动清空废纸篓。")
+        let result = MaintenanceResult(planID: planID, runID: stream.runID, title: plan.title, status: status, startedAt: started, finishedAt: Date(), items: results, selectedBytes: selectedBytes, trashedBytes: successful.reduce(0) { $0 + ($1.estimatedBytes ?? 0) }, freeBytesDelta: nil, message: (catalogInvalidationReason.map { $0 + "\n" } ?? "") + "移入废纸篓不会立即释放对应空间；未自动清空废纸篓。")
         try store.write(result, "History/\(stream.runID).json")
         try journal(store, stream.runID, state: "finished")
         return result
