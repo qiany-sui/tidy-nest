@@ -114,6 +114,29 @@ final class DiskSnapshotTests: XCTestCase {
         XCTAssertEqual(model.requestedDirectory?.path, "/unreadable/child")
     }
 
+    func testIncompleteScanKeepsLastCompleteReportAndSelection() async throws {
+        let original = try report("/fixture/original", size: 12)
+        let model = WorkspaceModel(detect: { MoleInstallation(executableURL: URL(fileURLWithPath: "/fixture/mole"), version: "1.54.0") }, analyze: { directory, _ in
+            if directory.path == original.path { return original }
+            return try MoleParser.diskReport(Data(#"{"scan_status":"partial","path":"/fixture/incomplete","overview":false,"entries":[],"total_size":0}"#.utf8))
+        })
+        model.start()
+        await settle(model)
+        model.analyze(directory: URL(fileURLWithPath: original.path))
+        await settle(model)
+        model.selectedDiskEntryID = original.entries.first?.id
+        model.analyze(directory: URL(fileURLWithPath: "/fixture/incomplete"))
+        await settle(model)
+        XCTAssertEqual(model.diskReport?.path, original.path)
+        XCTAssertEqual(model.diskReport?.totalSize, 12)
+        XCTAssertEqual(model.selectedDiskEntry?.name, "notes.txt")
+        XCTAssertEqual(model.requestedDirectory?.path, "/fixture/incomplete")
+        XCTAssertTrue(model.canAnalyzeDisk)
+        XCTAssertEqual(model.operationHistory.records.first?.status, .failed)
+        guard case .failed(let message) = model.diskPhase else { return XCTFail("不完整结果必须说明读取失败") }
+        XCTAssertTrue(message.contains("未能完整读取"))
+    }
+
     private func workspace(_ gate: DiskSnapshotGate) async -> WorkspaceModel {
         let model = WorkspaceModel(detect: { MoleInstallation(executableURL: URL(fileURLWithPath: "/fixture/mole"), version: "1.54.0") }, analyze: { directory, _ in try await gate.next(directory) })
         model.start()

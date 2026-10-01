@@ -33,6 +33,33 @@ struct MoleCoreTests {
         }
     }
 
+    @Test func diskAcceptsExplicitCompleteScan() throws {
+        let report = try MoleParser.diskReport(Data(#"{"scan_status":"complete","path":"/tmp/example","overview":false,"entries":[{"scan_status":"complete","name":"notes.txt","path":"/tmp/example/notes.txt","size":12,"is_dir":false}],"total_size":12,"total_files":1}"#.utf8))
+        #expect(report.totalSize == 12)
+        #expect(report.entries.first?.size == 12)
+    }
+
+    @Test(arguments: ["partial", "unavailable", "unknown", "future-status"], [true, false])
+    func diskRejectsIncompleteReportOrEntry(status: String, atReport: Bool) throws {
+        let entry: [String: Any] = ["scan_status": atReport ? "complete" : status, "name": "unreadable", "path": "/tmp/example/unreadable", "size": 0, "is_dir": true]
+        let json: [String: Any] = ["scan_status": atReport ? status : "complete", "path": "/tmp/example", "overview": false, "entries": [entry], "total_size": 0]
+        do {
+            _ = try MoleParser.diskReport(JSONSerialization.data(withJSONObject: json))
+            Issue.record("未读完整的结果不能显示为零占用")
+        } catch let error as MoleError {
+            #expect(error.localizedDescription.contains("未能完整读取"))
+        }
+    }
+
+    @Test(arguments: [true, false])
+    func diskRejectsMalformedScanStatus(atReport: Bool) throws {
+        for status in [NSNull(), 1, true] as [Any] {
+            let entry: [String: Any] = ["scan_status": atReport ? "complete" : status, "name": "example", "path": "/tmp/example/example", "size": 0, "is_dir": true]
+            let json: [String: Any] = ["scan_status": atReport ? status : "complete", "path": "/tmp/example", "overview": false, "entries": [entry], "total_size": 0]
+            #expect(throws: MoleError.self) { try MoleParser.diskReport(JSONSerialization.data(withJSONObject: json)) }
+        }
+    }
+
     @Test func applicationIdentityUsesPathAndUnknownSizeStaysUnknown() throws {
         let apps = try MoleParser.applications(Data(#"[{"name":"Example","bundle_id":"com.example.app","source":"App","uninstall_name":"Example","path":"/Applications/Example.app","size":"24 MB"},{"name":"Example","bundle_id":"com.example.app","source":"App","uninstall_name":"Example","path":"/Users/example/Applications/Example.app","size":"N/A"}]"#.utf8))
         #expect(Set(apps.map(\.id)).count == 2)
@@ -154,7 +181,7 @@ struct MoleCoreTests {
         } catch { Issue.record("错误类型不正确") }
     }
 
-    @Test(arguments: ["1.53.0", "1.54.0"])
+    @Test(arguments: ["1.53.0", "1.54.0", "1.56.1"])
     func serviceDetectsAndUsesOnlyReadOnlyQueries(version: String) async throws {
         let fixture = try ScriptFixture(#"""
         if [ "$#" = 1 ] && [ "$1" = --version ]; then
@@ -253,7 +280,8 @@ struct MoleCoreTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.script.path + ".queried"))
     }
 
-    @Test func queryAcceptsUpgradeToAnotherVerifiedVersion() async throws {
+    @Test(arguments: [("1.53.0", "1.54.0"), ("1.54.0", "1.56.1")])
+    func queryAcceptsUpgradeToAnotherVerifiedVersion(versions: (String, String)) async throws {
         let fixture = try ScriptFixture(#"""
         if [ "$1" = --version ]; then
           /bin/cat "${0}.version"
@@ -265,10 +293,10 @@ struct MoleCoreTests {
         """#)
         defer { fixture.remove() }
         let versionFile = URL(fileURLWithPath: fixture.script.path + ".version")
-        try Data("Mole version 1.53.0\n".utf8).write(to: versionFile)
+        try Data("Mole version \(versions.0)\n".utf8).write(to: versionFile)
         let service = MoleService(candidates: [fixture.script])
         let installation = try await service.detect()
-        try Data("Mole version 1.54.0\n".utf8).write(to: versionFile)
+        try Data("Mole version \(versions.1)\n".utf8).write(to: versionFile)
         let apps = try await service.applications(using: installation)
         #expect(apps.first?.name == "After upgrade")
     }
@@ -279,7 +307,7 @@ struct MoleCoreTests {
         catch { Issue.record("错误类型不正确") }
     }
 
-    @Test(arguments: ["1.52.0", "1.53.1", "1.54.1", "1.55.0", "2.0.0", "1.54.0-beta"])
+    @Test(arguments: ["1.52.0", "1.53.1", "1.54.1", "1.55.0", "1.56.0", "1.56.2", "2.0.0", "1.54.0-beta", "1.56.1-beta"])
     func unsupportedVersionPreventsExecution(version: String) async throws {
         let installation = MoleInstallation(executableURL: URL(fileURLWithPath: "/does/not/exist"), version: version)
         do { _ = try await MoleService().applications(using: installation); Issue.record("未知版本应拒绝查询") }

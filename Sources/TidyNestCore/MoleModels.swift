@@ -3,7 +3,7 @@ import Foundation
 public struct MoleInstallation: Sendable, Equatable {
     public let executableURL: URL
     public let version: String
-    public static let supportedVersions = ["1.53.0", "1.54.0"]
+    public static let supportedVersions = ["1.53.0", "1.54.0", "1.56.1"]
     public var isSupported: Bool { Self.supportedVersions.contains(version) }
 
     public init(executableURL: URL, version: String) {
@@ -42,6 +42,17 @@ public struct MoleDiskEntry: Identifiable, Sendable, Hashable, Decodable {
     }
 }
 
+extension MoleDiskEntry {
+    public init(from decoder: any Decoder) throws {
+        try requireCompleteDiskScan(decoder)
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decode(String.self, forKey: .name)
+        path = try values.decode(String.self, forKey: .path)
+        size = try values.decode(UInt64.self, forKey: .size)
+        isDirectory = try values.decode(Bool.self, forKey: .isDirectory)
+    }
+}
+
 public struct MoleDiskReport: Sendable, Decodable {
     public let path: String
     public let overview: Bool
@@ -58,6 +69,7 @@ public struct MoleDiskReport: Sendable, Decodable {
     }
 
     public init(from decoder: any Decoder) throws {
+        try requireCompleteDiskScan(decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         path = try values.decode(String.self, forKey: .path)
         overview = try values.decode(Bool.self, forKey: .overview)
@@ -78,6 +90,16 @@ public struct MoleDiskReport: Sendable, Decodable {
     }
 }
 
+private enum DiskScanCodingKeys: String, CodingKey { case scanStatus = "scan_status" }
+
+private func requireCompleteDiskScan(_ decoder: any Decoder) throws {
+    let values = try decoder.container(keyedBy: DiskScanCodingKeys.self)
+    // 旧版没有此字段；新版必须明确完整，避免把部分读取或未知占用显示为总量或零。
+    if values.contains(.scanStatus), try values.decode(String.self, forKey: .scanStatus) != "complete" {
+        throw MoleError.incompleteDiskScan
+    }
+}
+
 public enum MoleError: Error, LocalizedError, Sendable {
     case notInstalled
     case invalidVersion
@@ -85,6 +107,7 @@ public enum MoleError: Error, LocalizedError, Sendable {
     case invalidDirectory
     case invalidExecutable
     case invalidResponse(String)
+    case incompleteDiskScan
     case launchFailed(String)
     case processFailed(Int32, String)
     case timedOut
@@ -98,6 +121,7 @@ public enum MoleError: Error, LocalizedError, Sendable {
         case .invalidDirectory: "请选择一个存在的本地目录。"
         case .invalidExecutable: "Mole 路径不在已知安装位置，请重新检测。"
         case .invalidResponse(let context): "Mole 返回的\(context)格式不正确，无法显示结果。"
+        case .incompleteDiskScan: "Mole 未能完整读取所选目录，部分占用未知。本次结果未显示，请选择可读取的子目录后重试。"
         case .launchFailed(let detail): "无法启动 Mole：\(Self.safeDiagnostic(detail))"
         case .processFailed(let status, let detail): "Mole 查询失败（退出码 \(status)）。\(Self.safeDiagnostic(detail))"
         case .timedOut: "Mole 查询超时，请缩小查询范围后重试。"
@@ -120,6 +144,7 @@ internal enum MoleParser {
 
     static func diskReport(_ data: Data) throws -> MoleDiskReport {
         do { return try JSONDecoder().decode(MoleDiskReport.self, from: data) }
+        catch let error as MoleError { throw error }
         catch { throw MoleError.invalidResponse("磁盘信息") }
     }
 

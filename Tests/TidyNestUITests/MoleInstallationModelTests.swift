@@ -89,27 +89,29 @@ final class MoleInstallationModelTests: XCTestCase {
         XCTAssertTrue(model.showsConnectionNotice, "不支持的版本仍需明确提示")
     }
 
-    func testMole154DetectionEnablesManualQueriesAndMaintenance() async {
-        let queries = InstallationApplicationQueries()
-        let maintenance = inertMaintenance()
-        let model = WorkspaceModel(detect: { installedMole(version: "1.54.0") }, applications: { installation in
-            XCTAssertEqual(installation.version, "1.54.0")
-            return await queries.next()
-        }, maintenance: maintenance)
-        model.start()
-        await settle(model)
-        XCTAssertEqual(model.connectionPhase, .loaded)
-        XCTAssertTrue(model.canQuery)
-        XCTAssertTrue(maintenance.canStart)
-        XCTAssertFalse(model.showsConnectionNotice)
-        XCTAssertFalse(model.canInstallMole)
-        let initialCount = await queries.count
-        XCTAssertEqual(initialCount, 0, "检测成功仍应等待用户主动读取")
-        model.loadApplications()
-        await settle(model)
-        XCTAssertEqual(model.applicationsPhase, .loaded)
-        let finalCount = await queries.count
-        XCTAssertEqual(finalCount, 1)
+    func testVerifiedMoleDetectionEnablesManualQueriesAndMaintenance() async {
+        for version in ["1.54.0", "1.56.1"] {
+            let queries = InstallationApplicationQueries()
+            let maintenance = inertMaintenance()
+            let model = WorkspaceModel(detect: { installedMole(version: version) }, applications: { installation in
+                XCTAssertEqual(installation.version, version)
+                return await queries.next()
+            }, maintenance: maintenance)
+            model.start()
+            await settle(model)
+            XCTAssertEqual(model.connectionPhase, .loaded)
+            XCTAssertTrue(model.canQuery)
+            XCTAssertTrue(maintenance.canStart)
+            XCTAssertFalse(model.showsConnectionNotice)
+            XCTAssertFalse(model.canInstallMole)
+            let initialCount = await queries.count
+            XCTAssertEqual(initialCount, 0, "检测成功仍应等待用户主动读取")
+            model.loadApplications()
+            await settle(model)
+            XCTAssertEqual(model.applicationsPhase, .loaded)
+            let finalCount = await queries.count
+            XCTAssertEqual(finalCount, 1)
+        }
     }
 
     func testSuccessfulInstallationUsesFreshDetectionInsteadOfInstallerReturnValue() async {
