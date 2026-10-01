@@ -172,7 +172,11 @@ struct MaintenanceView: View {
             } else {
                 HSplitView {
                     planList.frame(minWidth: 320, idealWidth: 430)
-                    planDetail.frame(minWidth: 285, idealWidth: 340)
+                    // 固定详情宿主，避免首次选中条目时重新分配左右宽度。
+                    GeometryReader { geometry in
+                        planDetail.frame(width: geometry.size.width, height: geometry.size.height)
+                    }
+                    .frame(minWidth: 285, idealWidth: 340)
                 }
             }
             Divider()

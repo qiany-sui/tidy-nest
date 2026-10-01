@@ -19,10 +19,15 @@ enum WorkspacePage: String, CaseIterable, Identifiable {
     }
 }
 
+enum ApplicationSortOrder {
+    case name, sizeDescending
+}
+
 @MainActor @Observable
 final class WorkspaceModel {
     var page: WorkspacePage = .applications
     var searchText = ""
+    var applicationSortOrder: ApplicationSortOrder = .name
     var selectedApplicationID: String?
     var selectedDiskEntryID: String?
     private(set) var installation: MoleInstallation?
@@ -111,14 +116,66 @@ final class WorkspaceModel {
     }
     var filteredApplications: [MoleApplication] {
         let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return applications.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let matches = applications.filter {
+            search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)
+                || URL(fileURLWithPath: $0.path).lastPathComponent.localizedCaseInsensitiveContains(search)
+                || $0.bundleIdentifier.localizedCaseInsensitiveContains(search)
+        }
+        // Mole 与单项刷新都提供显示体积；只用于列表排序，不作为移除依据。
+        let rows = matches.map { (application: $0, size: applicationSortOrder == .sizeDescending ? sizeForSorting($0.displaySize) : nil) }
+        return rows.sorted { lhs, rhs in
+            if applicationSortOrder == .sizeDescending, lhs.size != rhs.size {
+                if let left = lhs.size, let right = rhs.size { return left > right }
+                return lhs.size != nil
+            }
+            let nameOrder = lhs.application.name.localizedStandardCompare(rhs.application.name)
+            return nameOrder == .orderedSame
+                ? lhs.application.path.localizedStandardCompare(rhs.application.path) == .orderedAscending
+                : nameOrder == .orderedAscending
+        }.map(\.application)
+    }
+
+    private static let sizeSortUnits: [String: Double] = {
+        var units: [String: Double] = ["B": 1, "BYTE": 1, "BYTES": 1, "字节": 1,
+            "KB": 1_000, "MB": 1_000_000, "GB": 1_000_000_000,
+            "TB": 1_000_000_000_000, "PB": 1_000_000_000_000_000]
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.includesCount = false
+        formatter.allowsNonnumericFormatting = false
+        let scales: [(ByteCountFormatter.Units, Int64)] = [(.useBytes, 1), (.useKB, 1_000), (.useMB, 1_000_000),
+            (.useGB, 1_000_000_000), (.useTB, 1_000_000_000_000), (.usePB, 1_000_000_000_000_000)]
+        // 单项刷新使用系统本地化单位，Mole 则固定使用英文单位，两者都须识别。
+        for (unit, bytes) in scales {
+            formatter.allowedUnits = unit
+            let label = formatter.string(fromByteCount: max(2, bytes)).filter { !$0.isWhitespace }.uppercased()
+            units[label] = Double(bytes)
+        }
+        return units
+    }()
+
+    private func sizeForSorting(_ displaySize: String) -> Double? {
+        let compact = displaySize.filter { !$0.isWhitespace }.uppercased()
+        let decimalSeparator = Locale.current.decimalSeparator ?? "."
+        let number = compact.prefix { $0.isNumber || $0 == "." || String($0) == decimalSeparator }
+        let normalized = number.map { $0.wholeNumberValue.map(String.init) ?? String($0) }.joined()
+            .replacingOccurrences(of: decimalSeparator, with: ".")
+        guard let amount = Double(normalized), amount.isFinite, amount >= 0 else {
+            // 系统格式化器可能把零显示为“Zero KB”，未知值仍排在真实零之后。
+            return displaySize == ByteCountFormatter.string(fromByteCount: 0, countStyle: .file) ? 0 : nil
+        }
+        guard let multiplier = Self.sizeSortUnits[String(compact.dropFirst(number.count))] else { return nil }
+        let bytes = amount * multiplier
+        return bytes.isFinite ? bytes : nil
     }
     var selectedApplication: MoleApplication? {
         filteredApplications.first { $0.id == selectedApplicationID }
     }
     var sortedDiskEntries: [MoleDiskEntry] {
         (diskReport?.entries ?? []).sorted { $0.size == $1.size ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.size > $1.size }
+    }
+    var displayedDiskDirectory: URL? {
+        diskReport.map { URL(fileURLWithPath: $0.path) } ?? requestedDirectory
     }
     var selectedDiskEntry: MoleDiskEntry? { diskReport?.entries.first { $0.id == selectedDiskEntryID } }
     var connectionLabel: String {
@@ -309,8 +366,6 @@ final class WorkspaceModel {
         guard canAnalyzeDisk, let installation else { return }
         cancelOperation()
         requestedDirectory = directory.standardizedFileURL
-        diskReport = nil
-        selectedDiskEntryID = nil
         diskPhase = .loading
         let activity = OperationActivity(kind: .diskAnalysis, title: "读取文件夹：\(directory.lastPathComponent)", targetPath: directory.standardizedFileURL.path)
         queryActivity = activity
@@ -321,6 +376,9 @@ final class WorkspaceModel {
                 let result = try await diskQuery(directory, installation)
                 guard operationID == id, !Task.isCancelled else { return }
                 diskReport = result
+                if let selectedDiskEntryID, !result.entries.contains(where: { $0.id == selectedDiskEntryID }) {
+                    self.selectedDiskEntryID = nil
+                }
                 diskPhase = .loaded
                 operationHistory.record(activity.finished(.completed,
                     summary: "共 \(result.totalFiles) 个文件，占用 \(formattedBytes(result.totalSize))。仅读取占用，未执行移除。"))
@@ -347,7 +405,7 @@ final class WorkspaceModel {
     }
 
     func goUp() {
-        guard canAnalyzeDisk, let directory = requestedDirectory, directory.path != "/" else { return }
+        guard canAnalyzeDisk, let directory = displayedDiskDirectory, directory.path != "/" else { return }
         analyze(directory: directory.deletingLastPathComponent())
     }
 

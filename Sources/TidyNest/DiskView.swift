@@ -17,7 +17,7 @@ struct DiskView: View {
                     .buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.canAnalyzeDisk)
             }.padding(28)
 
-            if let directory = model.requestedDirectory {
+            if let directory = model.displayedDiskDirectory {
                 HStack(spacing: 12) {
                     Button(action: model.goUp) { Image(systemName: "arrow.up") }
                         .help("返回上层文件夹").disabled(!model.canAnalyzeDisk || directory.path == "/")
@@ -48,11 +48,43 @@ struct DiskView: View {
                 .buttonStyle(.borderless).padding(.horizontal, 28).padding(.bottom, 18)
             }
             Divider()
-            if model.diskPhase == .loaded, let report = model.diskReport {
+            if let report = model.diskReport {
+                if model.diskPhase != .loaded { refreshStatus(report) }
                 diskResults(report)
             } else {
                 QueryStatusView(phase: model.diskPhase, idleTitle: "空间，慢慢理清", idleMessage: "选择想查看的文件夹，了解其中的文件和子文件夹占用。", symbol: "internaldrive", cancel: model.cancelOperation)
             }
+        }
+    }
+
+    private func refreshStatus(_ report: MoleDiskReport) -> some View {
+        HStack(spacing: 10) {
+            if model.diskPhase == .loading || model.diskPhase == .cancelling {
+                ProgressView().controlSize(.small)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(refreshMessage).textSelection(.enabled)
+                Text("当前仍显示上次结果：\(report.path)").foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            Spacer(minLength: 12)
+            if model.diskPhase == .loading {
+                Button("取消读取", action: model.cancelOperation)
+            } else if model.diskPhase != .cancelling, let directory = model.requestedDirectory {
+                Button("重试读取") { model.analyze(directory: directory) }.disabled(!model.canAnalyzeDisk)
+            }
+        }
+        .font(.caption).padding(.horizontal, 28).padding(.vertical, 10)
+        .background(NestStyle.green.opacity(0.07))
+    }
+
+    private var refreshMessage: String {
+        let path = model.requestedDirectory?.path ?? ""
+        return switch model.diskPhase {
+        case .loading: "正在读取：\(path)"
+        case .cancelling: "正在取消读取，等待查询收尾：\(path)"
+        case .cancelled: "已取消读取：\(path)"
+        case .failed(let message): "读取失败：\(path)\n\(message)"
+        default: ""
         }
     }
 

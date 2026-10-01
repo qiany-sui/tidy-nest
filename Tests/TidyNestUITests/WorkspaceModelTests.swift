@@ -98,7 +98,7 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(model.diskPhase, .idle)
     }
 
-    func testDiskFailureDoesNotKeepPreviousReportOrSelection() async {
+    func testDiskFailureKeepsPreviousReportAndSelection() async {
         let requests = DiskResponses()
         let model = WorkspaceModel(detect: { installation() }, applications: { _ in [] }, analyze: { directory, _ in try await requests.next(directory) })
         model.start()
@@ -109,21 +109,22 @@ final class WorkspaceModelTests: XCTestCase {
         model.selectedDiskEntryID = "/tmp/example/notes.txt"
         model.analyze(directory: URL(fileURLWithPath: "/tmp/other"))
         await settle(model)
-        XCTAssertNil(model.diskReport)
-        XCTAssertNil(model.selectedDiskEntryID)
+        XCTAssertEqual(model.diskReport?.path, "/tmp/example")
+        XCTAssertEqual(model.diskReport?.totalSize, 12)
+        XCTAssertEqual(model.selectedDiskEntryID, "/tmp/example/notes.txt")
         XCTAssertEqual(model.requestedDirectory?.path, "/tmp/other")
         guard case .failed = model.diskPhase else { return XCTFail("磁盘错误必须单独显示") }
     }
 
     func testSearchDistinguishesPathsAndHidesFilteredSelection() async {
         let model = WorkspaceModel(detect: { installation() }, applications: { _ in
-            [application("Example", path: "/tmp/one.app"), application("Example", path: "/tmp/two.app"), application("Other", path: "/tmp/other.app")]
+            [application("Example Name", path: "/tmp/one.app"), application("Example Name", path: "/tmp/two.app"), application("Other", path: "/tmp/other.app")]
         }, analyze: { _, _ in throw CancellationError() })
         model.start()
         await settle(model)
         model.loadApplications()
         await settle(model)
-        model.searchText = "eXaMpLe"
+        model.searchText = "eXaMpLe NaMe"
         XCTAssertEqual(Set(model.filteredApplications.map(\.path)), ["/tmp/one.app", "/tmp/two.app"])
         model.selectedApplicationID = "/tmp/two.app"
         XCTAssertEqual(model.selectedApplication?.path, "/tmp/two.app")

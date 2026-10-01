@@ -92,7 +92,7 @@ struct ApplicationsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("搜索应用名称", text: $model.searchText).textFieldStyle(.plain)
+                TextField("搜索名称、文件名或 Bundle ID", text: $model.searchText).textFieldStyle(.plain)
                 if !model.searchText.isEmpty {
                     Button { model.searchText = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain)
                 }
@@ -101,11 +101,15 @@ struct ApplicationsView: View {
             HStack {
                 Text("\(model.filteredApplications.count) 个应用")
                 Spacer()
-                Text("按名称排序")
+                Picker("应用排序", selection: $model.applicationSortOrder) {
+                    Text("按名称排序").tag(ApplicationSortOrder.name)
+                    Text("占用从大到小").tag(ApplicationSortOrder.sizeDescending)
+                }.labelsHidden().pickerStyle(.menu).fixedSize()
+                    .help("按列表显示的占用排序，未知占用排在最后")
             }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 19).padding(.bottom, 9)
 
             if model.filteredApplications.isEmpty {
-                NestEmptyState(symbol: "magnifyingglass", title: "没有匹配的应用", message: "试试其他名称。")
+                NestEmptyState(symbol: "magnifyingglass", title: "没有匹配的应用", message: "试试应用名称、文件名或 Bundle ID。")
             } else {
                 List(selection: $model.selectedApplicationID) {
                     ForEach(model.filteredApplications) { application in
@@ -136,6 +140,13 @@ struct ApplicationsView: View {
                         Text(application.displaySize.isEmpty ? "占用未知" : application.displaySize)
                             .font(.system(size: 28, weight: .light, design: .rounded)).foregroundStyle(NestStyle.green)
                     }.padding(.top, 12)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Button { model.openUninstallPlan(application) } label: {
+                            Label("检查移除计划", systemImage: "checklist")
+                        }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.canPlanUninstall(application))
+                        Text("无需先刷新。检查后由你核对并确认移入废纸篓。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Divider()
                     DetailField(label: "来源", value: application.source)
                     DetailField(label: "Bundle ID", value: application.bundleIdentifier)
@@ -147,12 +158,6 @@ struct ApplicationsView: View {
                         Button { model.reveal(path: application.path) } label: { Label("在 Finder 中显示", systemImage: "folder") }
                             .controlSize(.large)
                     }
-                    Divider()
-                    Button { model.openUninstallPlan(application) } label: {
-                        Label("检查移除计划", systemImage: "checklist")
-                    }.controlSize(.large).disabled(!model.canPlanUninstall(application))
-                    Text("可直接检查移除计划，无需先刷新。检查时会重新核验应用与相关文件，再由你确认移入废纸篓。")
-                        .font(.caption).foregroundStyle(.secondary)
                 }.padding(28).frame(maxWidth: .infinity, alignment: .leading)
             }.background(NestStyle.subtle.opacity(0.5))
         } else {
