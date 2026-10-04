@@ -83,6 +83,94 @@ final class MaintenanceModelTests: XCTestCase {
         XCTAssertEqual(model.selectedItemIDs, ["parent", "child"])
     }
 
+    func testBulkDeselectRecursivelyClearsDependenciesOutsideSearch() async {
+        let plan = fixturePlan(items: [
+            fixtureItem("root"), fixtureItem("other"),
+            fixtureItem("child", dependencies: ["root", "other"]),
+            fixtureItem("grandchild", dependencies: ["child"])
+        ])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.setFilteredItemsSelected(true)
+        model.requestConfirmation()
+        model.searchText = "root"
+        model.setFilteredItemsSelected(false)
+        XCTAssertEqual(model.selectedItemIDs, ["other"])
+        XCTAssertNil(model.confirmation)
+        model.setFilteredItemsSelected(true)
+        XCTAssertEqual(model.selectedItemIDs, ["root", "other"], "重新勾选父项不能恢复搜索结果外的子项")
+    }
+
+    func testLargeSyntheticPlanBulkSelectionKeepsExactItemsAndOrder() async {
+        let items = (0..<4000).map { fixtureItem("item-\($0)") }
+        let plan = fixturePlan(items: items + [fixtureItem("blocked", selection: .blocked)])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        let clock = ContinuousClock()
+        let selectStart = clock.now
+        model.setFilteredItemsSelected(true)
+        let selectDuration = selectStart.duration(to: clock.now)
+        XCTAssertEqual(model.selectedItemIDs.count, 4000)
+        model.requestConfirmation()
+        XCTAssertEqual(model.confirmation?.itemIDs, items.map(\.itemID))
+        let deselectStart = clock.now
+        model.setFilteredItemsSelected(false)
+        let deselectDuration = deselectStart.duration(to: clock.now)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        XCTAssertNil(model.confirmation)
+        print("维护批量选择基准：4000 项，勾选 \(selectDuration)，取消 \(deselectDuration)")
+    }
+
+    func testProtectionNoticeExplainsExactApplicationCacheScanRoot() async {
+        let root = "/fixture/home/Library/Caches/org.example.fixture"
+        let item = MaintenanceItem(itemID: "file", ruleID: "cache", path: root + "/nested/A.cache", displayName: "A", kind: .file, action: .trashItem, estimatedBytes: 12, reason: "隔离测试", impact: "移入废纸篓", selection: .optional, blockedReason: nil, dependsOnItemIDs: [])
+        let plan = fixturePlan(items: [item], scopeRoots: ["/fixture/home/Library/Caches", "/fixture/home/Library/Logs"])
+        let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+        model.scanClean()
+        await model.waitForCurrentOperation()
+        model.changeProtection(path: item.path, protected: true)
+        await model.waitForCurrentOperation()
+        XCTAssertTrue(model.planExpired)
+        XCTAssertTrue(model.notice?.contains(root) == true, "保护单文件后应说明跳过整个所属 Bundle ID 扫描根")
+        XCTAssertTrue(model.notice?.contains(item.path) == true, "提示应关联实际保护路径")
+        XCTAssertFalse(model.notice?.contains("/fixture/home/Library/Logs") == true)
+    }
+
+    func testProtectionNoticeUsesWholeContainerScopeAndUninstallCacheRoot() async {
+        for (root, scopes) in [
+            ("/fixture/home/Library/Containers/UUID/Data/Library/Caches", ["/fixture/home/Library/Containers/UUID/Data/Library/Caches"]),
+            ("/fixture/home/Library/Logs/org.example.fixture", ["/fixture/Fixture.app"])
+        ] {
+            let item = MaintenanceItem(itemID: "file", ruleID: "cache", path: root + "/nested/A.cache", displayName: "A", kind: .file, action: .trashItem, estimatedBytes: 12, reason: "隔离测试", impact: "移入废纸篓", selection: .optional, blockedReason: nil, dependsOnItemIDs: [])
+            let plan = fixturePlan(kind: .uninstall, items: [item], scopeRoots: scopes)
+            let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+            model.scanClean()
+            await model.waitForCurrentOperation()
+            model.changeProtection(path: item.path, protected: true)
+            await model.waitForCurrentOperation()
+            XCTAssertTrue(model.notice?.contains("整个扫描目录：\n" + root + "\n") == true,
+                          "容器按 scope 根跳过；普通卸载计划也应识别其未列入 scopeRoots 的全局日志根")
+        }
+    }
+
+    func testProtectionExplanationUsesScopeRootBeforeNestedLibraryNames() async {
+        for (kind, ruleID, root, suffix, scopes) in [
+            (MaintenanceKind.clean, "mole.user-log.exact-file.v1", "/fixture/home/Library/Logs/org.example.fixture", "/nested/Library/Caches/A.log", ["/fixture/home/Library/Caches", "/fixture/home/Library/Logs"]),
+            (.uninstall, "mole.user-log.exact-file.v1", "/fixture/home/Library/Logs/org.example.fixture", "/nested/Library/Caches/A.log", ["/fixture/Fixture.app"]),
+            (.clean, "mole.user-cache.exact-file.v1", "/fixture/Library/Caches/user/home/Library/Caches/org.example.fixture", "/nested/Library/Logs/A.cache", ["/fixture/Library/Caches/user/home/Library/Caches", "/fixture/Library/Caches/user/home/Library/Logs"])
+        ] {
+            let item = MaintenanceItem(itemID: "file", ruleID: ruleID, path: root + suffix, displayName: "A", kind: .file, action: .trashItem, estimatedBytes: 12, reason: "隔离测试", impact: "移入废纸篓", selection: .optional, blockedReason: nil, dependsOnItemIDs: [])
+            let plan = fixturePlan(kind: kind, items: [item], scopeRoots: scopes)
+            let model = MaintenanceModel(actions: fixtureActions(scan: { _ in plan }))
+            model.scanClean()
+            await model.waitForCurrentOperation()
+            XCTAssertTrue(model.protectionExplanation(for: item).contains("整个扫描目录：\n" + root + "\n"),
+                          "根来自实际扫描范围，不受home或文件内部同名Library路径影响")
+        }
+    }
+
     func testBulkSelectionRespectsBusyAndExpiredPlanGuards() async {
         let model = MaintenanceModel(actions: fixtureActions())
         model.scanClean()
@@ -538,8 +626,8 @@ private func fixtureItem(_ id: String, selection: PlanSelection = .optional, kin
     MaintenanceItem(itemID: id, ruleID: "cache", path: "/fixture/\(id)", displayName: id, kind: kind, action: .trashItem, estimatedBytes: 12, reason: "隔离测试", impact: "移入废纸篓", selection: selection, blockedReason: selection == .blocked ? "受保护" : nil, dependsOnItemIDs: dependencies)
 }
 
-private func fixturePlan(kind: MaintenanceKind = .clean, items: [MaintenanceItem] = [fixtureItem("cache")], complete: Bool = true) -> MaintenancePlan {
-    MaintenancePlan(schemaVersion: 1, planID: "fixture-plan", runID: "fixture-scan", kind: kind, title: "隔离计划", engineVersion: "fixture", engineDigest: "fixture", rulesVersion: "fixture", configurationDigest: "fixture", createdAt: Date(), scopeRoots: ["/fixture"], scanComplete: complete, scanIssues: [], items: items)
+private func fixturePlan(kind: MaintenanceKind = .clean, items: [MaintenanceItem] = [fixtureItem("cache")], complete: Bool = true, scopeRoots: [String] = ["/fixture"]) -> MaintenancePlan {
+    MaintenancePlan(schemaVersion: 1, planID: "fixture-plan", runID: "fixture-scan", kind: kind, title: "隔离计划", engineVersion: "fixture", engineDigest: "fixture", rulesVersion: "fixture", configurationDigest: "fixture", createdAt: Date(), scopeRoots: scopeRoots, scanComplete: complete, scanIssues: [], items: items)
 }
 
 private func fixtureResult(status: MaintenanceStatus = .completed, items: [MaintenanceItemResult] = []) -> MaintenanceResult {

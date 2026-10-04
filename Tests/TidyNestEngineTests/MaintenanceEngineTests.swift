@@ -269,6 +269,27 @@ func persistentCacheFilesAreOptionalWithExplicitImpact(_ name: String) async thr
     #expect(try await apply(engine, fresh, fresh.items.map(\.itemID)).status == .blocked)
 }
 
+@Test func protectingOneFileSkipsItsEntireCacheRootAndNamesProtection() async throws {
+    let fixture = try Fixture()
+    let target = try fixture.file("Protected.cache", "protected fixture")
+    let sibling = try fixture.file("Sibling.cache", "sibling fixture")
+    let logs = fixture.home.appendingPathComponent("Library/Logs/" + fixture.bundleID)
+    try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+    let log = logs.appendingPathComponent("Available.log")
+    try Data("log fixture".utf8).write(to: log)
+    let engine = fixture.engine()
+    let before = try await scan(engine)
+    #expect(Set(before.items.map(\.path)) == [target.path, sibling.path, log.path])
+    _ = try await engine.handle(command: "protect-path", request: MaintenanceRequest(protectedPath: target.path), emit: { _ in })
+    let protected = try await scan(engine)
+    #expect(protected.scanComplete)
+    #expect(protected.items.map(\.path) == [log.path])
+    let issue = try #require(protected.scanIssues.first { $0.path == fixture.cache.path })
+    #expect(issue.reason.contains(target.path))
+    #expect(try String(contentsOf: target, encoding: .utf8) == "protected fixture")
+    #expect(try String(contentsOf: sibling, encoding: .utf8) == "sibling fixture")
+}
+
 @Test func stagingChangeRestoresWithoutTrashing() async throws {
     let fixture = try Fixture()
     let target = try fixture.file("A.cache")

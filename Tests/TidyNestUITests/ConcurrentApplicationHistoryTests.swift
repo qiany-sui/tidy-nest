@@ -231,7 +231,8 @@ final class ConcurrentApplicationHistoryTests: XCTestCase {
         model.refreshApplication(parallelApp)
         await fixture.apps.release()
         await waitUntil { model.applicationRefreshPhase == .loaded }
-        XCTAssertTrue(log.removeRecords(confirmedIDs))
+        let removed = await log.removeRecords(confirmedIDs)
+        XCTAssertTrue(removed)
         XCTAssertEqual(log.records.map(\.kind), [.applicationRefresh])
         await fixture.history.release()
         await waitUntil { model.maintenance.historyPhase == .loaded }

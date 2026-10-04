@@ -37,7 +37,7 @@ struct RootView: View {
                             Image(systemName: page.symbol).font(.system(size: 16)).frame(width: 20)
                             Text(page.title).font(.system(size: 14, weight: .medium))
                             Spacer()
-                            if model.page == page { Circle().fill(NestStyle.green).frame(width: 5, height: 5) }
+                            if model.page == page { Circle().fill(NestStyle.green).frame(width: 5, height: 5).accessibilityHidden(true) }
                         }
                         .foregroundStyle(model.page == page ? NestStyle.green : Color.primary.opacity(0.75))
                         .padding(.horizontal, 13).padding(.vertical, 12)
@@ -45,6 +45,7 @@ struct RootView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain).padding(.horizontal, 12).padding(.bottom, 5)
+                    .accessibilityAddTraits(model.page == page ? .isSelected : [])
                 }
                 Spacer()
                 VStack(alignment: .leading, spacing: 12) {
@@ -74,12 +75,24 @@ struct RootView: View {
                 if model.showsConnectionNotice && model.page != .history {
                     connectionNotice
                 }
+                ForEach(model.backgroundReadStatuses) { status in
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text(status.message).lineLimit(2).help(status.message)
+                        Spacer()
+                        Button("返回查看") { model.page = status.page }
+                        Button("取消") { model.cancelRead(on: status.page) }
+                            .disabled(status.isCancelling || model.isTerminating)
+                    }.font(.callout).padding(12).background(NestStyle.green.opacity(0.07))
+                }
                 if model.maintenance.isBusy && model.page != .clean {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
                         Text(model.maintenance.progressMessage.isEmpty ? "正在处理维护请求…" : model.maintenance.progressMessage).lineLimit(2)
                         Spacer()
-                        if model.maintenance.isExecuting { Button("查看执行进度") { model.page = .clean } }
+                        Button("查看进度") { model.page = .clean }
+                        Button("取消", action: model.maintenance.cancel)
+                            .disabled(model.maintenance.phase == .cancelling || model.isTerminating)
                     }.font(.callout).padding(12).background(NestStyle.green.opacity(0.07))
                 }
                 switch model.page {

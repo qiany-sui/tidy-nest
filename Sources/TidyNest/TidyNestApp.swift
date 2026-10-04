@@ -24,10 +24,36 @@ struct TidyNestApp: App {
         }
         .defaultSize(width: 1180, height: 760)
         .windowStyle(.hiddenTitleBar)
-        .commands { CommandGroup(replacing: .newItem) {} }
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+            SearchCommands()
+        }
         Settings {
             SettingsView(model: model)
                 .tint(NestStyle.green)
+        }
+    }
+}
+
+private struct SearchActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
+extension FocusedValues {
+    var searchAction: (() -> Void)? {
+        get { self[SearchActionKey.self] }
+        set { self[SearchActionKey.self] = newValue }
+    }
+}
+
+private struct SearchCommands: Commands {
+    @FocusedValue(\.searchAction) private var searchAction
+
+    var body: some Commands {
+        CommandGroup(after: .textEditing) {
+            Button("搜索") { searchAction?() }
+                .keyboardShortcut("f", modifiers: .command)
+                .disabled(searchAction == nil)
         }
     }
 }

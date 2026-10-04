@@ -99,7 +99,9 @@ struct DiskView: View {
     }
 
     private func diskResults(_ report: MoleDiskReport) -> some View {
-        VStack(spacing: 0) {
+        let entries = model.visibleDiskEntries
+        let largest = entries.map(\.size).max() ?? 0
+        return VStack(spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 32) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("总占用").font(.caption).foregroundStyle(.secondary)
@@ -112,45 +114,38 @@ struct DiskView: View {
                 Spacer()
                 Text("按占用从大到小").font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 28).padding(.vertical, 22)
+            if !report.largeFiles.isEmpty {
+                HStack(spacing: 12) {
+                    Picker("磁盘结果", selection: $model.diskResultMode) {
+                        Text("当前目录").tag(DiskResultMode.directory)
+                        Text("大文件").tag(DiskResultMode.largeFiles)
+                    }
+                    .labelsHidden().pickerStyle(.segmented).fixedSize()
+                    Text("大文件来自本次读取结果，切换不会再次扫描。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 28).padding(.bottom, 12)
+            }
             Divider()
-            if report.entries.isEmpty {
+            if entries.isEmpty {
                 NestEmptyState(symbol: "folder", title: "没有可显示的项目", message: "所选位置本次未返回文件或子文件夹。")
             } else {
                 HSplitView {
                     List(selection: $model.selectedDiskEntryID) {
-                        ForEach(model.sortedDiskEntries) { entry in
-                            HStack(spacing: 12) {
-                                Image(systemName: entry.isDirectory ? "folder.fill" : "doc")
-                                    .font(.system(size: 22)).foregroundStyle(entry.isDirectory ? NestStyle.green : .secondary).frame(width: 30)
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(entry.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
-                                    GeometryReader { geometry in
-                                        Capsule().fill(NestStyle.green.opacity(0.12))
-                                            .overlay(alignment: .leading) {
-                                                Capsule().fill(NestStyle.green.opacity(0.5))
-                                                    .frame(width: geometry.size.width * proportion(entry, in: report))
-                                            }
-                                    }.frame(height: 4).frame(maxWidth: 150)
-                                }
-                                Spacer(minLength: 8)
-                                Text(formattedBytes(entry.size)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
-                                if entry.isDirectory {
-                                    Button { model.analyze(directory: URL(fileURLWithPath: entry.path)) } label: { Image(systemName: "chevron.right") }
-                                        .buttonStyle(.borderless).help("打开 \(entry.name)").accessibilityLabel("打开文件夹 \(entry.name)").disabled(!model.canAnalyzeDisk)
-                                }
-                            }
-                            .padding(.vertical, 10).tag(entry.id)
+                        ForEach(entries) { entry in
+                            diskRow(entry, largest: largest).tag(entry.id)
                         }
                     }
                     .contextMenu(forSelectionType: String.self) { ids in
-                        if ids.count == 1, let entry = report.entries.first(where: { ids.contains($0.id) }) {
+                        if ids.count == 1, let entry = entries.first(where: { ids.contains($0.id) }) {
                             if entry.isDirectory {
                                 Button("查看文件夹") { model.analyze(directory: URL(fileURLWithPath: entry.path)) }.disabled(!model.canAnalyzeDisk)
                             }
                             Button("在 Finder 中显示") { model.reveal(path: entry.path) }
                         }
                     } primaryAction: { ids in
-                        guard ids.count == 1, let entry = report.entries.first(where: { ids.contains($0.id) }),
+                        guard ids.count == 1, let entry = entries.first(where: { ids.contains($0.id) }),
                               entry.isDirectory else { return }
                         model.analyze(directory: URL(fileURLWithPath: entry.path))
                     }
@@ -165,9 +160,33 @@ struct DiskView: View {
         }
     }
 
-    private func proportion(_ entry: MoleDiskEntry, in report: MoleDiskReport) -> Double {
-        let largest = report.entries.map(\.size).max() ?? 0
-        return largest == 0 ? 0 : min(1, Double(entry.size) / Double(largest))
+    private func diskRow(_ entry: MoleDiskEntry, largest: UInt64) -> some View {
+        let proportion = largest == 0 ? 0 : min(1, Double(entry.size) / Double(largest))
+        return HStack(spacing: 12) {
+            Image(systemName: entry.isDirectory ? "folder.fill" : "doc")
+                .font(.system(size: 22)).foregroundStyle(entry.isDirectory ? NestStyle.green : .secondary).frame(width: 30)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(entry.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                if model.diskResultMode == .largeFiles {
+                    Text(entry.path).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                GeometryReader { geometry in
+                    Capsule().fill(NestStyle.green.opacity(0.12))
+                        .overlay(alignment: .leading) {
+                            Capsule().fill(NestStyle.green.opacity(0.5))
+                                .frame(width: geometry.size.width * proportion)
+                        }
+                }.frame(height: 4).frame(maxWidth: 150)
+            }
+            Spacer(minLength: 8)
+            Text(formattedBytes(entry.size)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            if entry.isDirectory {
+                Button { model.analyze(directory: URL(fileURLWithPath: entry.path)) } label: { Image(systemName: "chevron.right") }
+                    .buttonStyle(.borderless).help("打开 \(entry.name)").accessibilityLabel("打开文件夹 \(entry.name)").disabled(!model.canAnalyzeDisk)
+            }
+        }
+        .padding(.vertical, 10).help(entry.path)
     }
 
     @ViewBuilder private var diskDetail: some View {

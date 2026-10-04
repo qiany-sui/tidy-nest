@@ -6,6 +6,7 @@ struct MaintenanceView: View {
     @Bindable var model: WorkspaceModel
     @State private var showForceEnd = false
     @State private var showScanIssues = false
+    @FocusState private var isSearchFocused: Bool
     private var maintenance: MaintenanceModel { model.maintenance }
 
     var body: some View {
@@ -188,6 +189,9 @@ struct MaintenanceView: View {
                     }
                     Text("移入废纸篓不会立即释放磁盘空间。")
                         .font(.caption).foregroundStyle(.secondary)
+                    if let message = model.maintenanceWaitingMessage {
+                        Text(message).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
                 Button("核对所选项目…") { maintenance.requestConfirmation() }
@@ -217,6 +221,7 @@ struct MaintenanceView: View {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("搜索名称或路径", text: Binding(get: { maintenance.searchText }, set: { maintenance.searchText = $0 }))
                     .textFieldStyle(.plain)
+                    .focused($isSearchFocused)
             }.padding(10).background(NestStyle.subtle, in: RoundedRectangle(cornerRadius: 8)).padding(16)
             HStack {
                 Button(isSearching ? "全选搜索结果" : "全选") {
@@ -261,7 +266,7 @@ struct MaintenanceView: View {
                     }
                 }
             }.listStyle(.inset)
-        }
+        }.focusedSceneValue(\.searchAction) { isSearchFocused = true }
     }
 
     @ViewBuilder private var planDetail: some View {
@@ -283,6 +288,7 @@ struct MaintenanceView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Button { model.reveal(path: item.path) } label: { Label("在 Finder 中显示", systemImage: "folder") }
+                    DetailField(label: "长期保护范围", value: maintenance.protectionExplanation(for: item))
                     Button { maintenance.changeProtection(path: item.path, protected: true) } label: { Label("长期保护此项目", systemImage: "shield") }
                         .disabled(!maintenance.canStart)
                 }.padding(28).frame(maxWidth: .infinity, alignment: .leading)

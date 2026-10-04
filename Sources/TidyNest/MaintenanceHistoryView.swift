@@ -4,12 +4,11 @@ import TidyNestProtocol
 
 struct MaintenanceHistoryView: View {
     @Bindable var model: WorkspaceModel
-    @State private var selectedID: String?
     @State private var deletion: HistoryDeletion?
     private var maintenance: MaintenanceModel { model.maintenance }
     private var history: OperationHistoryModel { model.operationHistory }
     private var records: [OperationRecord] { history.records }
-    private var selectedRecord: OperationRecord? { records.first { $0.id == selectedID } }
+    private var selectedRecord: OperationRecord? { records.first { $0.id == history.selectedRecordID } }
     private var canDelete: Bool { !model.isTerminating && !maintenance.isExecuting && history.canDelete }
 
     var body: some View {
@@ -50,11 +49,18 @@ struct MaintenanceHistoryView: View {
             }
             Divider()
             if records.isEmpty {
-                NestEmptyState(symbol: "clock.arrow.circlepath", title: "还没有操作记录",
-                               message: "刷新应用、读取文件夹或检查计划后，结果会显示在这里。此前未记录的查询不会补录。")
+                if history.isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("正在读取本地记录…").font(.callout).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    NestEmptyState(symbol: "clock.arrow.circlepath", title: "还没有操作记录",
+                                   message: "刷新应用、读取文件夹或检查计划后，结果会显示在这里。此前未记录的查询不会补录。")
+                }
             } else {
                 HSplitView {
-                    List(selection: $selectedID) {
+                    List(selection: Binding(get: { history.selectedRecordID }, set: { history.selectedRecordID = $0 })) {
                         ForEach(records) { record in
                             VStack(alignment: .leading, spacing: 8) {
                                 Text(record.title).font(.headline).lineLimit(2)
@@ -90,7 +96,7 @@ struct MaintenanceHistoryView: View {
             if maintenance.historyPhase == .idle { maintenance.reloadHistory() }
         }
         .onChange(of: records.map(\.id)) { _, ids in
-            if let selectedID, !ids.contains(selectedID) { self.selectedID = nil }
+            if let selectedID = history.selectedRecordID, !ids.contains(selectedID) { history.selectedRecordID = nil }
         }
         .alert(deletion?.title ?? "删除操作记录", isPresented: Binding(
             get: { deletion != nil },
@@ -99,7 +105,7 @@ struct MaintenanceHistoryView: View {
             Button("取消", role: .cancel) { deletion = nil }
             Button(pending.all ? "清空记录" : "删除记录", role: .destructive) {
                 guard canDelete else { return }
-                history.removeRecords(Set(pending.records.map(\.id)))
+                Task { await history.removeRecords(Set(pending.records.map(\.id))) }
                 deletion = nil
             }
         } message: { pending in
@@ -190,10 +196,11 @@ private extension OperationRecord {
 struct MaintenanceResultView: View {
     let result: MaintenanceResult
     let reveal: (String) -> Void
+    @State private var needingReviewOnly = false
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+            LazyVStack(alignment: .leading, spacing: 22) {
                 HStack(alignment: .top, spacing: 14) {
                     Image(systemName: result.status == .completed ? "checkmark.circle" : "info.circle")
                         .font(.system(size: 30, weight: .light)).foregroundStyle(NestStyle.green)
@@ -214,15 +221,36 @@ struct MaintenanceResultView: View {
                     DetailField(label: "记录到的卷可用空间变化", value: ByteCountFormatter.string(fromByteCount: delta, countStyle: .file))
                 }
                 Divider()
+                Text("已移入废纸篓 \(result.itemCount(for: .trashed)) · 已保留 \(result.itemCount(for: .skipped)) · 处理失败 \(result.itemCount(for: .failed)) · 已取消 \(result.itemCount(for: .cancelled)) · 待核对 \(result.itemCount(for: .unknown))")
+                    .font(.callout).foregroundStyle(.secondary)
+                Picker("显示项目", selection: $needingReviewOnly) {
+                    Text("全部（\(result.items.count)）").tag(false)
+                    Text("需要核对（\(result.itemCount(for: .failed) + result.itemCount(for: .unknown))）").tag(true)
+                }.pickerStyle(.segmented)
                 if result.items.isEmpty {
                     Text("没有逐项处理记录。请以上方状态和说明为准。").font(.callout).foregroundStyle(.secondary)
+                } else if needingReviewOnly && result.visibleItems(needingReviewOnly: true).isEmpty {
+                    Text("没有处理失败或结果待核对的项目。").font(.callout).foregroundStyle(.secondary)
                 }
-                ForEach(result.items) { item in
+                ForEach(result.visibleItems(needingReviewOnly: needingReviewOnly)) { item in
                     MaintenanceResultRow(item: item, reveal: reveal)
                     Divider()
                 }
             }.padding(28).frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onChange(of: result) { _, _ in needingReviewOnly = false }
+    }
+}
+
+extension MaintenanceResult {
+    func itemCount(for outcome: ItemOutcome) -> Int {
+        items.reduce(0) { $0 + ($1.outcome == outcome ? 1 : 0) }
+    }
+
+    func visibleItems(needingReviewOnly: Bool) -> [MaintenanceItemResult] {
+        guard needingReviewOnly else { return items }
+        // 已保留、已取消都是确定结果；失败与未知结果需要用户核对原因和位置。
+        return items.filter { $0.outcome == .failed || $0.outcome == .unknown }
     }
 }
 

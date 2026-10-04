@@ -4,12 +4,13 @@ import TidyNestCore
 
 struct ApplicationsView: View {
     @Bindable var model: WorkspaceModel
+    @FocusState private var isSearchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("应用").font(.system(size: 28, weight: .semibold))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("应用").font(.system(size: 26, weight: .semibold))
                     Text("了解 Mac 上的应用，从一份清晰的列表开始。")
                         .font(.callout).foregroundStyle(.secondary)
                 }
@@ -19,7 +20,7 @@ struct ApplicationsView: View {
                 }
                 .buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.canQuery)
             }
-            .padding(28)
+            .padding(.horizontal, 24).padding(.vertical, 18)
             Divider()
 
             if model.hasApplicationSnapshot { refreshStatus }
@@ -39,6 +40,7 @@ struct ApplicationsView: View {
                 QueryStatusView(phase: model.applicationsPhase, idleTitle: "你的应用，一目了然", idleMessage: "点击「读取应用」，查看应用的来源、位置和大小。", symbol: "square.grid.2x2", cancel: model.cancelOperation)
             }
         }
+        .focusedSceneValue(\.searchAction, model.applications.isEmpty ? nil : { isSearchFocused = true })
     }
 
     private var refreshStatus: some View {
@@ -47,11 +49,23 @@ struct ApplicationsView: View {
                 ProgressView().controlSize(.small)
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text(refreshMessage).textSelection(.enabled)
-                if let updatedAt = model.applicationsUpdatedAt {
-                    Text("完整列表更新于 \(updatedAt.formatted(date: .abbreviated, time: .shortened))")
-                        .foregroundStyle(.secondary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        Text(refreshMessage).fixedSize(horizontal: true, vertical: false)
+                        if let updatedAt = model.applicationsUpdatedAt {
+                            Text("完整列表更新于 \(updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .foregroundStyle(.secondary).fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(refreshMessage)
+                        if let updatedAt = model.applicationsUpdatedAt {
+                            Text("完整列表更新于 \(updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
+                .textSelection(.enabled)
                 if let notice = model.applicationCacheNotice {
                     Text(notice).foregroundStyle(.secondary)
                 }
@@ -63,7 +77,7 @@ struct ApplicationsView: View {
                 Button("取消更新", action: model.cancelOperation)
             }
         }
-        .font(.caption).padding(.horizontal, 28).padding(.vertical, 10)
+        .font(.caption).padding(.horizontal, 24).padding(.vertical, 8)
         .background(NestStyle.green.opacity(0.07))
     }
 
@@ -92,12 +106,15 @@ struct ApplicationsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("搜索名称、文件名或 Bundle ID", text: $model.searchText).textFieldStyle(.plain)
+                TextField("搜索名称、文件名或 Bundle ID", text: $model.searchText)
+                    .textFieldStyle(.plain).focused($isSearchFocused)
                 if !model.searchText.isEmpty {
                     Button { model.searchText = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain)
+                        .accessibilityLabel("清除应用搜索")
                 }
             }
-            .padding(10).background(NestStyle.subtle, in: RoundedRectangle(cornerRadius: 8)).padding(16)
+            .padding(10).background(NestStyle.subtle, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 14).padding(.vertical, 10)
             HStack {
                 Text("\(model.filteredApplications.count) 个应用")
                 Spacer()
@@ -106,7 +123,7 @@ struct ApplicationsView: View {
                     Text("占用从大到小").tag(ApplicationSortOrder.sizeDescending)
                 }.labelsHidden().pickerStyle(.menu).fixedSize()
                     .help("按列表显示的占用排序，未知占用排在最后")
-            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 19).padding(.bottom, 9)
+            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 17).padding(.bottom, 7)
 
             if model.filteredApplications.isEmpty {
                 NestEmptyState(symbol: "magnifyingglass", title: "没有匹配的应用", message: "试试应用名称、文件名或 Bundle ID。")

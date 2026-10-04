@@ -116,27 +116,84 @@ final class MaintenanceModel {
 
     func canSelect(_ item: MaintenanceItem) -> Bool {
         // “必选”约束执行清单，不应禁止用户撤回本次选择。
-        canStart && !planExpired && item.selection != .blocked && Set(item.dependsOnItemIDs).isSubset(of: selectedItemIDs)
+        canStart && !planExpired && selectionAllowed(item, in: selectedItemIDs)
     }
 
     func setSelected(_ id: String, selected: Bool) {
-        guard let item = plan?.items.first(where: { $0.itemID == id }), canSelect(item) else { return }
+        guard let items = plan?.items, let item = items.first(where: { $0.itemID == id }), canSelect(item) else { return }
+        var selection = selectedItemIDs
+        if selected { selection.insert(id) }
+        else { deselect(id, in: &selection, dependents: dependentItems(in: items)) }
         confirmation = nil
-        if selected { selectedItemIDs.insert(id) }
-        else {
-            selectedItemIDs.remove(id)
-            // 取消父项目时同步取消依赖项，避免确认清单包含无法独立执行的残留。
-            var changed = true
-            while changed {
-                let invalid = selectedItems.filter { !Set($0.dependsOnItemIDs).isSubset(of: selectedItemIDs) }.map(\.itemID)
-                changed = !invalid.isEmpty
-                selectedItemIDs.subtract(invalid)
-            }
-        }
+        selectedItemIDs = selection
     }
 
     func setFilteredItemsSelected(_ selected: Bool) {
-        for item in filteredItems { setSelected(item.itemID, selected: selected) }
+        guard canStart, !planExpired, let plan else { return }
+        var selection = selectedItemIDs
+        let dependents = selected ? [:] : dependentItems(in: plan.items)
+        var accepted = false
+        // 依赖仍按计划顺序判断；批量操作只发布一次选择，避免逐项查找和更新界面。
+        for item in filteredItems where selectionAllowed(item, in: selection) {
+            accepted = true
+            if selected { selection.insert(item.itemID) }
+            else { deselect(item.itemID, in: &selection, dependents: dependents) }
+        }
+        guard accepted else { return }
+        confirmation = nil
+        selectedItemIDs = selection
+    }
+
+    private func selectionAllowed(_ item: MaintenanceItem, in selection: Set<String>) -> Bool {
+        item.selection != .blocked && item.dependsOnItemIDs.allSatisfy { selection.contains($0) }
+    }
+
+    private func dependentItems(in items: [MaintenanceItem]) -> [String: [String]] {
+        var dependents: [String: [String]] = [:]
+        for item in items {
+            for parent in item.dependsOnItemIDs { dependents[parent, default: []].append(item.itemID) }
+        }
+        return dependents
+    }
+
+    private func deselect(_ id: String, in selection: inout Set<String>, dependents: [String: [String]]) {
+        selection.remove(id)
+        var removed = [id]
+        var index = 0
+        // 每个已选子项只入队一次，连锁取消也包含筛选结果以外的依赖项。
+        while index < removed.count {
+            for child in dependents[removed[index]] ?? [] where selection.remove(child) != nil { removed.append(child) }
+            index += 1
+        }
+    }
+
+    func protectionExplanation(for item: MaintenanceItem) -> String {
+        if item.kind == .application {
+            return "保护路径：\n\(item.path)\n后续检查会保留此应用本体，并跳过该应用的缓存与日志检查。"
+        }
+        let path = item.path
+        let scopeRoot = plan?.scopeRoots.filter {
+            ($0.hasSuffix("/Library/Caches") || $0.hasSuffix("/Library/Logs"))
+                && (path == $0 || path.hasPrefix($0 + "/"))
+        }.max { $0.count < $1.count }
+        let root: String
+        if let scopeRoot {
+            if scopeRoot.contains("/Library/Containers/") {
+                root = scopeRoot
+            } else if let bundleID = path.dropFirst(scopeRoot.count).split(separator: "/").first {
+                root = scopeRoot + "/" + String(bundleID)
+            } else {
+                root = scopeRoot
+            }
+        } else if let range = [path.range(of: "/Library/Caches/"), path.range(of: "/Library/Logs/")]
+            .compactMap({ $0 }).min(by: { $0.lowerBound < $1.lowerBound }),
+                  let bundleID = path[range.upperBound...].split(separator: "/").first {
+            // 卸载计划可能只列应用本体；从最先出现的入口取根，避免误认文件内的同名目录。
+            root = String(path[..<range.upperBound]) + String(bundleID)
+        } else {
+            root = path
+        }
+        return "保护路径：\n\(path)\n后续检查会跳过整个扫描目录：\n\(root)\n同目录的其他文件也不会列入计划。"
     }
 
     func scanClean() { startPlan(application: nil) }
@@ -318,6 +375,7 @@ final class MaintenanceModel {
 
     func changeProtection(path: String, protected: Bool) {
         guard let id = begin() else { return }
+        let explanation = plan?.items.first(where: { $0.path == path }).map(protectionExplanation)
         confirmation = nil
         protectionsPhase = .loading
         operation = Task {
@@ -328,7 +386,9 @@ final class MaintenanceModel {
                 else { try await actions.unprotect(path) }
                 planExpired = plan != nil
                 selectedItemIDs = []
-                notice = protected ? "已长期保护此项目。当前计划已失效，请重新扫描。" : "已取消长期保护。当前计划已失效，请重新扫描。"
+                notice = protected
+                    ? "已长期保护此项目。\(explanation.map { "\n" + $0 } ?? "")\n当前计划已失效，请重新扫描。"
+                    : "已取消长期保护。当前计划已失效，请重新扫描。"
                 protectedPaths = try await actions.protections()
                 protectionsPhase = .loaded
             } catch {

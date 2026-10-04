@@ -23,6 +23,15 @@ enum ApplicationSortOrder {
     case name, sizeDescending
 }
 
+enum DiskResultMode { case directory, largeFiles }
+
+struct WorkspaceReadStatus: Identifiable, Equatable {
+    let page: WorkspacePage
+    let message: String
+    let isCancelling: Bool
+    var id: WorkspacePage { page }
+}
+
 @MainActor @Observable
 final class WorkspaceModel {
     var page: WorkspacePage = .applications
@@ -30,6 +39,9 @@ final class WorkspaceModel {
     var applicationSortOrder: ApplicationSortOrder = .name
     var selectedApplicationID: String?
     var selectedDiskEntryID: String?
+    var diskResultMode: DiskResultMode = .directory {
+        didSet { clearMissingDiskSelection() }
+    }
     private(set) var installation: MoleInstallation?
     private(set) var connectionPhase: QueryPhase = .idle
     private(set) var installPhase: QueryPhase = .idle
@@ -100,6 +112,43 @@ final class WorkspaceModel {
     var hasApplicationSnapshot: Bool { applicationsUpdatedAt != nil }
     var canQuery: Bool { installation?.isSupported == true && canReadWorkspace }
     var canAnalyzeDisk: Bool { canQuery }
+    var activeWorkspaceRead: WorkspaceReadStatus? {
+        if diskPhase == .loading || diskPhase == .cancelling {
+            return WorkspaceReadStatus(page: .disk, message: "\(diskPhase == .cancelling ? "正在取消磁盘读取，等待收尾" : "正在读取文件夹")：\(requestedDirectory?.path ?? "")", isCancelling: diskPhase == .cancelling)
+        }
+        if applicationRefreshPhase == .loading || applicationRefreshPhase == .cancelling {
+            return WorkspaceReadStatus(page: .applications, message: "\(applicationRefreshPhase == .cancelling ? "正在取消应用刷新，等待收尾" : "正在刷新应用")：\(applicationRefreshTarget?.name ?? "")", isCancelling: applicationRefreshPhase == .cancelling)
+        }
+        if applicationsPhase == .loading || applicationsPhase == .cancelling {
+            return WorkspaceReadStatus(page: .applications, message: applicationsPhase == .cancelling ? "正在取消应用列表读取，等待收尾…" : "正在读取应用列表…", isCancelling: applicationsPhase == .cancelling)
+        }
+        return nil
+    }
+    var backgroundReadStatuses: [WorkspaceReadStatus] {
+        var statuses = activeWorkspaceRead.map { [$0] } ?? []
+        if maintenance.isReadingHistory {
+            let cancelling = maintenance.historyPhase == .cancelling
+            statuses.append(WorkspaceReadStatus(page: .history, message: cancelling ? "正在取消操作记录读取，等待收尾…" : "正在读取操作记录…", isCancelling: cancelling))
+        }
+        return statuses.filter { $0.page != page }
+    }
+    func cancelRead(on page: WorkspacePage) {
+        if page == .history { maintenance.cancelHistory() }
+        else if activeWorkspaceRead?.page == page { cancelOperation() }
+    }
+    var maintenanceWaitingMessage: String? {
+        guard !maintenance.canStart, !maintenance.isBusy else { return nil }
+        if isTerminating { return "正在退出，等待任务收尾。" }
+        var reasons: [String] = []
+        if let read = activeWorkspaceRead { reasons.append(read.message) }
+        if maintenance.isReadingHistory {
+            reasons.append(maintenance.historyPhase == .cancelling ? "操作记录读取正在取消收尾" : "操作记录仍在读取")
+        }
+        if isDetectingMole { reasons.append("Mole 检测尚未结束") }
+        if installPhase == .loading || installPhase == .cancelling { reasons.append("Mole 安装尚未结束") }
+        guard !reasons.isEmpty else { return nil }
+        return reasons.joined(separator: "；") + "。结束后可继续选择并核对项目。"
+    }
     private var canReadWorkspace: Bool {
         operationID == nil && cleanupID == nil && !isTerminating
             && (!maintenance.isBusy || maintenance.phase == .scanning)
@@ -174,10 +223,23 @@ final class WorkspaceModel {
     var sortedDiskEntries: [MoleDiskEntry] {
         (diskReport?.entries ?? []).sorted { $0.size == $1.size ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.size > $1.size }
     }
+    var visibleDiskEntries: [MoleDiskEntry] {
+        guard diskResultMode == .largeFiles else { return sortedDiskEntries }
+        return (diskReport?.largeFiles ?? []).sorted {
+            if $0.size != $1.size { return $0.size > $1.size }
+            return $0.path.localizedStandardCompare($1.path) == .orderedAscending
+        }
+    }
     var displayedDiskDirectory: URL? {
         diskReport.map { URL(fileURLWithPath: $0.path) } ?? requestedDirectory
     }
-    var selectedDiskEntry: MoleDiskEntry? { diskReport?.entries.first { $0.id == selectedDiskEntryID } }
+    var selectedDiskEntry: MoleDiskEntry? {
+        let entries = diskResultMode == .largeFiles ? diskReport?.largeFiles : diskReport?.entries
+        return entries?.first { $0.id == selectedDiskEntryID }
+    }
+    private func clearMissingDiskSelection() {
+        if selectedDiskEntryID != nil, selectedDiskEntry == nil { selectedDiskEntryID = nil }
+    }
     var connectionLabel: String {
         if installPhase == .loading { return "正在安装 Mole" }
         if installPhase == .cancelling { return "正在取消安装" }
@@ -376,9 +438,8 @@ final class WorkspaceModel {
                 let result = try await diskQuery(directory, installation)
                 guard operationID == id, !Task.isCancelled else { return }
                 diskReport = result
-                if let selectedDiskEntryID, !result.entries.contains(where: { $0.id == selectedDiskEntryID }) {
-                    self.selectedDiskEntryID = nil
-                }
+                if result.largeFiles.isEmpty { diskResultMode = .directory }
+                clearMissingDiskSelection()
                 diskPhase = .loaded
                 operationHistory.record(activity.finished(.completed,
                     summary: "共 \(result.totalFiles) 个文件，占用 \(formattedBytes(result.totalSize))。仅读取占用，未执行移除。"))
@@ -448,6 +509,7 @@ final class WorkspaceModel {
         await cleanupTask?.value
         cleanupTask = nil
         await maintenance.prepareToTerminate(cancel: cancelMaintenance)
+        await operationHistory.waitForPersistence()
     }
 
     func prepareToCloseWindow(cancelMaintenance: Bool) async {

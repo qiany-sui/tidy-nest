@@ -236,7 +236,9 @@ struct EngineRules: Sendable {
         return Configuration(patterns: patterns, protections: protections, deno: deno, digest: digest(try MaintenanceJSON.encoder().encode(payload)))
     }
     func fileBlock(_ path: String, configuration: Configuration) -> String? {
-        if configuration.protections.contains(where: { protectionContains(path, $0) || protectionContains($0, path) }) { return "用户长期保护。" }
+        if let protection = configuration.protections.first(where: { protectionContains(path, $0) || protectionContains($0, path) }) {
+            return "用户长期保护：\(protection)。该路径涉及的扫描目录已保留。"
+        }
         if protectionContains(path, configuration.deno) || protectionContains(configuration.deno, path) { return "Deno 缓存包含持久状态，已保护。" }
         var ancestors = [path]
         var parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
